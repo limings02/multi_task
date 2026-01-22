@@ -1,0 +1,16 @@
+raw:
+  # Default Windows paths; override via CLI flags or env (ALICCP_SKELETON_PATH / ALICCP_COMMON_FEATURES_PATH)
+  skeleton_path: data/raw/sample_skeleton_train.csv
+  common_features_path: data/raw/common_features_train.csv
+canonical:
+  out_dir: data/interim/aliccp_canonical
+  sqlite_path: data/interim/aliccp_canonical/common_features.sqlite
+  samples_path: data/interim/aliccp_canonical/samples_train.parquet
+  tokens_dir: data/interim/aliccp_canonical/tokens_train
+params:
+  nrows: null
+  chunksize_sk: 1000000
+  chunksize_cf: 500000
+  buffer_max_tokens: 300000
+  rebuild_sqlite: false
+  overwrite: false
