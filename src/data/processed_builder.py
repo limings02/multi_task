@@ -332,46 +332,34 @@ def _collect_tokens_for_batch(
     # Use glob pattern - single query over all parts
     glob_pattern = str(token_dir / "*.parquet").replace("\\", "/")
     
-    # Memory-safe DuckDB configuration
+    # Memory-safe DuckDB configuration for 16GB system
     con = duckdb.connect()
-    # Limit DuckDB memory to ~4GB to avoid OOM (adjust based on your system)
-    con.execute("SET memory_limit = '4GB'")
+    # Limit DuckDB memory - use 6GB to leave room for Python overhead
+    con.execute("SET memory_limit = '6GB'")
     # Use temp directory for spilling if needed
     con.execute("SET temp_directory = 'data/.duckdb_tmp'")
     # Enable parallel processing
-    con.execute("SET threads TO 4")  # Conservative for memory
+    con.execute("SET threads TO 6")
+    # Disable insertion order preservation for better memory efficiency
+    con.execute("SET preserve_insertion_order = false")
     
     con.register("row_ids_tbl", pa.table({"row_id": pa.array(row_ids, type=pa.int64())}))
 
     src_col = "COALESCE(t.src, 0)" if has_src else "0"
-    # Key optimization: row_id BETWEEN filter is pushed down by DuckDB's optimizer
-    # before the JOIN, dramatically reducing scanned data
+    
+    # Use DuckDB aggregation but fetch raw rows for memory efficiency
+    # Aggregation in DuckDB is faster than Python, but we avoid list() which is memory-heavy
     sql = f"""
-        WITH filtered AS (
-            SELECT
-                t.row_id,
-                CAST({src_col} AS INTEGER) AS src,
-                CAST(t.field AS VARCHAR) AS field,
-                CAST(t.fid AS VARCHAR) AS fid,
-                CAST(t.val AS DOUBLE) AS val
-            FROM read_parquet('{glob_pattern}') t
-            WHERE t.row_id BETWEEN {min_id} AND {max_id}
-        ),
-        joined AS (
-            SELECT f.*
-            FROM filtered f
-            JOIN row_ids_tbl r ON f.row_id = r.row_id
-        )
         SELECT
-            row_id,
-            src,
-            field,
-            list(fid) AS fids,
-            list(val) AS vals,
-            COUNT(*) AS cnt,
-            SUM(CASE WHEN NOT isfinite(val) THEN 1 ELSE 0 END) AS nan_inf_cnt
-        FROM joined
-        GROUP BY row_id, src, field
+            t.row_id,
+            CAST({src_col} AS INTEGER) AS src,
+            CAST(t.field AS VARCHAR) AS field,
+            CAST(t.fid AS VARCHAR) AS fid,
+            CAST(t.val AS DOUBLE) AS val
+        FROM read_parquet('{glob_pattern}') t
+        JOIN row_ids_tbl r ON t.row_id = r.row_id
+        WHERE t.row_id BETWEEN {min_id} AND {max_id}
+        ORDER BY t.row_id, src, field
     """
     
     logger.info("  Running DuckDB glob query...")
@@ -379,58 +367,71 @@ def _collect_tokens_for_batch(
     t0 = time.perf_counter()
     
     try:
-        agg_tbl = con.execute(sql).fetch_arrow_table()
+        raw_tbl = con.execute(sql).fetch_arrow_table()
         elapsed = time.perf_counter() - t0
-        logger.info("  Query returned %d groups in %.1fs", agg_tbl.num_rows, elapsed)
+        logger.info("  Query returned %d raw rows in %.1fs", raw_tbl.num_rows, elapsed)
     except Exception as e:
         logger.error("DuckDB glob query failed: %s", e)
         con.close()
         raise
-
-    # Fast vectorized extraction - convert entire columns to Python lists once
-    t1 = time.perf_counter()
-    total_groups = agg_tbl.num_rows
     
-    # Batch convert to Python (much faster than per-row access)
-    all_rids = agg_tbl["row_id"].to_pylist()
-    all_srcs = agg_tbl["src"].to_pylist()
-    all_fields = agg_tbl["field"].to_pylist()
-    all_fids = agg_tbl["fids"].to_pylist()
-    all_vals = agg_tbl["vals"].to_pylist()
-    all_cnts = agg_tbl["cnt"].to_pylist()
-    all_nan_infs = agg_tbl["nan_inf_cnt"].to_pylist()
-    
-    logger.info("  Column extraction: %.1fs", time.perf_counter() - t1)
-    
-    # Process all groups (single pass, optimized)
-    t2 = time.perf_counter()
-    for i in range(total_groups):
-        rid = all_rids[i]
-        src = all_srcs[i]
-        field = all_fields[i]
-        fids = all_fids[i]
-        vals = all_vals[i]
-        cnt = all_cnts[i]
-        nan_inf = all_nan_infs[i]
-
-        # P1-4: track total tokens
-        total_tokens_counter[(src, field)] += cnt
-        if nan_inf > 0:
-            nan_inf_counter[(src, field)] += nan_inf
-
-        # Build (fid, val) pairs - optimized: avoid repeated tuple unpacking
-        key = (rid, src, field)
-        pairs = out[key]
-        for j in range(len(fids)):
-            fid = fids[j]
-            val = vals[j]
-            if val is None or not math.isfinite(val):
-                val = 0.0
-            pairs.append((fid, val))
-    
-    logger.info("  Group processing: %.1fs for %d groups", time.perf_counter() - t2, total_groups)
-
     con.close()
+
+    # Efficient vectorized processing using NumPy
+    t1 = time.perf_counter()
+    import numpy as np
+    
+    # Convert Arrow columns directly to numpy arrays (very fast, zero-copy when possible)
+    rids = raw_tbl["row_id"].to_numpy()
+    srcs = raw_tbl["src"].to_numpy()
+    fields = raw_tbl["field"].to_pandas().values  # string column needs pandas
+    fids = raw_tbl["fid"].to_pandas().values
+    vals = raw_tbl["val"].to_numpy()
+    
+    del raw_tbl  # Release Arrow memory
+    
+    logger.info("  Column extraction: %.1fs for %d rows", time.perf_counter() - t1, len(rids))
+    
+    # Handle NaN/Inf values vectorized
+    t2 = time.perf_counter()
+    nan_mask = np.isnan(vals) | np.isinf(vals)
+    vals = np.where(nan_mask, 0.0, vals)
+    
+    # Track nan_inf per (src, field) using simple counter (faster than np.unique for this)
+    if nan_mask.any():
+        nan_srcs = srcs[nan_mask]
+        nan_fields = fields[nan_mask]
+        for s, f in zip(nan_srcs, nan_fields):
+            nan_inf_counter[(s, f)] += 1
+    
+    # Skip total token counts here - will be counted during pair building
+    logger.info("  NaN handling: %.1fs", time.perf_counter() - t2)
+    
+    # Build token pairs - single pass through sorted data
+    t3 = time.perf_counter()
+    n = len(rids)
+    if n > 0:
+        # Data is already sorted by (row_id, src, field) from SQL ORDER BY
+        # Use group boundaries to efficiently build pairs and count tokens
+        prev_key = (rids[0], srcs[0], fields[0])
+        pairs = []
+        
+        for i in range(n):
+            curr_key = (rids[i], srcs[i], fields[i])
+            if curr_key != prev_key:
+                out[prev_key].extend(pairs)
+                # Count tokens for previous (src, field)
+                total_tokens_counter[(prev_key[1], prev_key[2])] += len(pairs)
+                pairs = []
+                prev_key = curr_key
+            pairs.append((fids[i], vals[i]))
+        
+        # Don't forget the last group
+        out[prev_key].extend(pairs)
+        total_tokens_counter[(prev_key[1], prev_key[2])] += len(pairs)
+    
+    logger.info("  Build pairs: %.1fs for %d rows", time.perf_counter() - t3, n)
+
     return out, nan_inf_counter, total_tokens_counter
 
 
