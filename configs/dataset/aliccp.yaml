@@ -9,8 +9,43 @@ canonical:
   tokens_dir: data/interim/aliccp_canonical/tokens_train
 params:
   nrows: null
-  chunksize_sk: 1000000
-  chunksize_cf: 500000
-  buffer_max_tokens: 300000
+  chunksize_sk: 100000
+  chunksize_cf: 50000
+  buffer_max_tokens: 3000000
   rebuild_sqlite: false
   overwrite: false
+compact:
+  manifest_path: null
+  in_tokens_dir: null
+  out_tokens_dir: null
+  target_parts: 100
+  max_rows_per_file: null
+  target_chunk_rows: 2000000
+  inplace: false
+  overwrite: false
+  seed: 20260121
+split:
+  method: entity_hash
+  seed: 20260121
+  ratios:
+    train: 0.95
+    valid: 0.05
+  out_dir: data/splits/aliccp_entity_hash_v1
+  overwrite: false
+  chunksize: 2000000
+tokens_split:
+  out_dir: data/splits/aliccp_entity_hash_v1/tokens
+  tokens_dir: null
+  split_dir: data/splits/aliccp_entity_hash_v1
+  flush_rows: 400000000
+  overwrite: false
+eda:
+  split_dir: data/splits/aliccp_entity_hash_v1
+  out_dir: data/stats/eda_v1
+  report_dir: reports/eda_v1
+  overwrite: false
+  backend: auto
+  batch_size: 500000
+  topk_n: 200
+  min_support: 1000
+  topk_jaccard_n: 100

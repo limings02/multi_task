@@ -61,4 +61,137 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_canonical_args(canonical_parser)
 
+    compact_parser = subparsers.add_parser(
+        "compact", help="Compact canonical tokens parquet parts."
+    )
+    compact_parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/dataset/aliccp.yaml",
+        help="Path to dataset config YAML.",
+    )
+    compact_parser.add_argument("--manifest-path", type=str, help="Path to manifest.json.")
+    compact_parser.add_argument("--in-tokens-dir", type=str, help="Input tokens directory override.")
+    compact_parser.add_argument("--out-tokens-dir", type=str, help="Output tokens directory.")
+    compact_parser.add_argument("--target-parts", type=int, help="Target number of output parts.")
+    compact_parser.add_argument(
+        "--max-rows-per-file", type=int, help="Max rows per output parquet (overrides target-parts)."
+    )
+    compact_parser.add_argument(
+        "--target-chunk-rows",
+        type=int,
+        default=None,
+        help="Rows to accumulate before writing a row group.",
+    )
+    compact_parser.add_argument("--seed", type=int, default=None, help="Seed for deterministic runs.")
+    compact_parser.add_argument(
+        "--inplace",
+        action="store_true",
+        help="Replace existing tokens_train with compacted output (backs up to tokens_train.bak).",
+    )
+    compact_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output tokens directory.",
+    )
+
+    split_parser = subparsers.add_parser(
+        "split", help="Split canonical samples into train/valid (hash by entity_id)."
+    )
+    split_parser.add_argument(
+        "--config", type=str, default="configs/dataset/aliccp.yaml", help="Path to dataset config."
+    )
+    split_parser.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing split outputs."
+    )
+    split_parser.add_argument("--seed", type=int, help="Override split seed.")
+    split_parser.add_argument("--train-ratio", type=float, help="Override train ratio.")
+    split_parser.add_argument("--valid-ratio", type=float, help="Override valid ratio.")
+
+    split_tokens_parser = subparsers.add_parser(
+        "split-tokens", help="Filter tokens into train/valid using split row_id membership."
+    )
+    split_tokens_parser.add_argument(
+        "--config", type=str, default="configs/dataset/aliccp.yaml", help="Path to dataset config."
+    )
+    split_tokens_parser.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing tokens split output."
+    )
+    split_tokens_parser.add_argument(
+        "--flush-rows", type=int, help="Rows threshold per output shard before flushing."
+    )
+
+    eda_parser = subparsers.add_parser("eda", help="Run EDA on a prepared split + tokens.")
+    eda_parser.add_argument(
+        "--config", type=str, default="configs/dataset/aliccp.yaml", help="Path to dataset config."
+    )
+    eda_parser.add_argument("--overwrite", action="store_true", help="Overwrite existing EDA outputs.")
+    eda_parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["auto", "duckdb", "pyarrow"],
+        help="Backend for aggregations.",
+    )
+    eda_parser.add_argument("--topk-n", dest="topk_n", type=int, help="Top-N for field fid ranking.")
+    eda_parser.add_argument(
+        "--min-support", dest="min_support", type=int, help="Minimum rows for fid lift."
+    )
+    eda_parser.add_argument(
+        "--topk-jaccard-n", dest="topk_jaccard_n", type=int, help="Top-K size for drift Jaccard."
+    )
+
+    eda_extra = subparsers.add_parser("eda-extra", help="Run refined EDA for FeatureMap decisions.")
+    eda_extra.add_argument(
+        "--config", type=str, default="configs/dataset/aliccp.yaml", help="Path to dataset config."
+    )
+    eda_extra.add_argument(
+        "--in-stats",
+        type=str,
+        default="data/stats/eda_v1",
+        help="Input directory containing base EDA outputs (field_stats_train etc.).",
+    )
+    eda_extra.add_argument(
+        "--out",
+        type=str,
+        default="data/stats/eda_extra_v1",
+        help="Output directory for structured parquet/json results.",
+    )
+    eda_extra.add_argument(
+        "--plots",
+        type=str,
+        default="reports/eda/eda_extra_v1",
+        help="Output directory for plots and featuremap patch/rationale.",
+    )
+    eda_extra.add_argument(
+        "--debug-sample",
+        action="store_true",
+        help="Use data/raw/fieldwise_100k.parquet for quick validation instead of full tokens.",
+    )
+    eda_extra.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs.")
+    eda_extra.add_argument(
+        "--log-level",
+        type=str,
+        default=None,
+        help="Set log level (INFO/DEBUG/WARN). Overrides LOGLEVEL env.",
+    )
+
+    process_parser = subparsers.add_parser(
+        "process", help="Convert split (samples+tokens) into processed training data."
+    )
+    process_parser.add_argument(
+        "--config", type=str, default="configs/dataset/featuremap.yaml", help="Path to featuremap yaml."
+    )
+    process_parser.add_argument(
+        "--split-dir", type=str, default="data/splits/aliccp_entity_hash_v1", help="Input split directory."
+    )
+    process_parser.add_argument(
+        "--out", type=str, default="data/processed/aliccp_entity_hash_v1", help="Output processed root directory."
+    )
+    process_parser.add_argument(
+        "--batch-size", type=int, default=500_000, help="Rows per processing batch."
+    )
+    process_parser.add_argument(
+        "--log-level", type=str, default=None, help="Set log level (INFO/DEBUG/WARN). Overrides LOGLEVEL env."
+    )
+
     return parser

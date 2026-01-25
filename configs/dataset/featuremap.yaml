@@ -1,0 +1,352 @@
+featuremap_version: 4
+dataset: Ali-CCP
+generated_from:
+  source: eda-extra
+  base_featuremap_patch: featuremap_patch.yaml
+  note: 'v3: user tweaks on top of v2: (1) replace small-cardinality single-hot vocab=1000
+    with minimal full-map enum-like vocab (distinct+2); (2) for high-collision hash
+    fields 205/110_14, double hash_bucket and halve embedding_dim to keep parameter
+    budget; keep other v2 adjustments.'
+  migrated_at: '2026-01-24T08:17:57.712918Z'
+  migration: schemaA_vocab_num_tokens+vocab_num_embeddings+special_base_offset (with
+    global token_policy)
+  safe4g_applied_at: '2026-01-24T08:28:01.904491Z'
+  safe4g_changes:
+    A_embedding_dim_dim8_to_dim4_fields:
+    - field: '205'
+      src: 0
+    - field: '207'
+      src: 0
+    - field: '509'
+      src: 0
+    - field: '101'
+      src: 1
+    - field: '110_14'
+      src: 1
+    - field: '127_14'
+      src: 1
+    B_max_len_120_to_60_fields:
+    - field: '110_14'
+      src: 1
+    - field: '127_14'
+      src: 1
+    rationale: '4GB GPU safe: reduce embedding params & activation by lowering dim
+      and max_len.'
+defaults:
+  dtype: int64
+  embedding_dim: 8
+  pooling: sum_sqrtn
+  use_value: false
+  is_multi_hot: false
+  max_len: null
+  vocab:
+    pad_token: __PAD__
+    oov_token: __OOV__
+    missing_token: __MISSING__
+    special_base_offset: 3
+    includes_special_tokens: true
+  hash:
+    seed: 17
+    special_base_offset: 2
+    missing_token: __MISSING__
+    pad_token: __PAD__
+features:
+- field: '508'
+  src: 0
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: true
+  pooling: none
+  vocab_num_tokens: 20000
+  special_base_offset: 3
+  vocab_num_embeddings: 20003
+  includes_special_tokens: true
+- field: '301'
+  src: 0
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 5
+  special_base_offset: 3
+  vocab_num_embeddings: 8
+  includes_special_tokens: true
+- field: '205'
+  src: 0
+  encoding: hash
+  embedding_dim: 4
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  hash_bucket: 8388608
+- field: '121'
+  src: 1
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 101
+  special_base_offset: 3
+  vocab_num_embeddings: 104
+  includes_special_tokens: true
+- field: '129'
+  src: 1
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 6
+  special_base_offset: 3
+  vocab_num_embeddings: 9
+  includes_special_tokens: true
+- field: '110_14'
+  src: 1
+  encoding: hash
+  embedding_dim: 4
+  is_multi_hot: true
+  max_len: 60
+  use_value: true
+  pooling: weighted_sum_sqrtn
+  hash_bucket: 8388608
+- field: '210'
+  src: 0
+  encoding: hybrid
+  embedding_dim: 8
+  is_multi_hot: true
+  max_len: 20
+  use_value: false
+  pooling: sum_sqrtn
+  hybrid_rule: topn
+  tail_encoding: hash
+  hash_bucket: 8192
+  vocab_num_tokens: 100000
+  special_base_offset: 3
+  vocab_num_embeddings: 100003
+  includes_special_tokens: true
+- field: '206'
+  src: 0
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 20000
+  special_base_offset: 3
+  vocab_num_embeddings: 20003
+  includes_special_tokens: true
+- field: '127'
+  src: 1
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 5
+  special_base_offset: 3
+  vocab_num_embeddings: 8
+  includes_special_tokens: true
+- field: '127_14'
+  src: 1
+  encoding: hash
+  embedding_dim: 4
+  is_multi_hot: true
+  max_len: 60
+  use_value: true
+  pooling: weighted_sum_sqrtn
+  hash_bucket: 4194304
+- field: '509'
+  src: 0
+  encoding: hash
+  embedding_dim: 4
+  is_multi_hot: false
+  max_len: null
+  use_value: true
+  pooling: none
+  hash_bucket: 4194304
+- field: '124'
+  src: 1
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 4
+  special_base_offset: 3
+  vocab_num_embeddings: 7
+  includes_special_tokens: true
+- field: '150_14'
+  src: 1
+  encoding: hybrid
+  embedding_dim: 8
+  is_multi_hot: true
+  max_len: 80
+  use_value: true
+  pooling: weighted_sum_sqrtn
+  hybrid_rule: topn
+  tail_encoding: hash
+  hash_bucket: 262144
+  vocab_num_tokens: 100000
+  special_base_offset: 3
+  vocab_num_embeddings: 100003
+  includes_special_tokens: true
+- field: '109_14'
+  src: 1
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: true
+  max_len: 80
+  use_value: true
+  pooling: weighted_sum_sqrtn
+  vocab_num_tokens: 20000
+  special_base_offset: 3
+  vocab_num_embeddings: 20003
+  includes_special_tokens: true
+- field: '216'
+  src: 0
+  encoding: hybrid
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  hybrid_rule: topn
+  tail_encoding: hash
+  hash_bucket: 524288
+  vocab_num_tokens: 200000
+  special_base_offset: 3
+  vocab_num_embeddings: 200003
+  includes_special_tokens: true
+- field: '207'
+  src: 0
+  encoding: hash
+  embedding_dim: 4
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  hash_bucket: 4194304
+- field: '702'
+  src: 0
+  encoding: hybrid
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: true
+  pooling: none
+  hybrid_rule: topn
+  tail_encoding: hash
+  hash_bucket: 32768
+  vocab_num_tokens: 200000
+  special_base_offset: 3
+  vocab_num_embeddings: 200003
+  includes_special_tokens: true
+- field: '126'
+  src: 1
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 5
+  special_base_offset: 3
+  vocab_num_embeddings: 8
+  includes_special_tokens: true
+- field: '101'
+  src: 1
+  encoding: hash
+  embedding_dim: 4
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  hash_bucket: 4194304
+- field: '125'
+  src: 1
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 9
+  special_base_offset: 3
+  vocab_num_embeddings: 12
+  includes_special_tokens: true
+- field: '128'
+  src: 1
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 4
+  special_base_offset: 3
+  vocab_num_embeddings: 7
+  includes_special_tokens: true
+- field: '122'
+  src: 1
+  encoding: vocab
+  embedding_dim: 8
+  is_multi_hot: false
+  max_len: null
+  use_value: false
+  pooling: none
+  vocab_num_tokens: 17
+  special_base_offset: 3
+  vocab_num_embeddings: 20
+  includes_special_tokens: true
+- field: '853'
+  src: 0
+  encoding: hybrid
+  embedding_dim: 8
+  is_multi_hot: true
+  max_len: 10
+  use_value: true
+  pooling: weighted_sum_sqrtn
+  hybrid_rule: topn
+  tail_encoding: hash
+  hash_bucket: 8192
+  vocab_num_tokens: 100000
+  special_base_offset: 3
+  vocab_num_embeddings: 100003
+  includes_special_tokens: true
+schema_version: 2
+token_policy:
+  vocab:
+    pad_id: 0
+    missing_id: 1
+    oov_id: 2
+    special_base_offset: 3
+    tokens:
+    - __PAD__
+    - __MISSING__
+    - __OOV__
+  hash:
+    pad_id: 0
+    missing_id: 1
+    special_base_offset: 2
+    tokens:
+    - __PAD__
+    - __MISSING__
+    seed_default: 17
+invariants:
+- encoding in {vocab,hybrid} => vocab_num_embeddings == vocab_num_tokens + token_policy.vocab.special_base_offset
+  (when includes_special_tokens=true)
+- encoding=hash or tail_encoding=hash => hashed_id = token_policy.hash.special_base_offset
+  + (hash(token) % hash_bucket)
+- is_multi_hot=false => max_len is null and pooling is none
+- is_multi_hot=true  => max_len is int>0 and pooling != none
