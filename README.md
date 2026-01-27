@@ -111,9 +111,9 @@ After canonical, you can compact many small token parquet files into ~100 larger
   ```
 - PowerShell：
   ```powershell
-  python -m src.cli.main process --config configs/dataset/featuremap.yaml --split-dir data/splits/aliccp_entity_hash_v1 --out data/processed --batch-size 300000
+  python -m src.cli.main process --config configs/dataset/featuremap.yaml --split-dir data/splits/aliccp_entity_hash_v1 --out data/processed --batch-size 100000
   ```
-- python -m src.cli.main process --config configs/dataset/featuremap.yaml --split-dir data/splits/aliccp_entity_hash_v1 --out data/processed --batch-size 300000 --log-level DEBUG
+- python -m src.cli.main process --config configs/dataset/featuremap.yaml --split-dir data/splits/aliccp_entity_hash_v1 --out data/processed --batch-size 100000 --log-level DEBUG
 
 - Bash helper：
   ```bash
@@ -149,3 +149,24 @@ train_loader = build_dataloader(
 2. **Hybrid 编码紧凑**：tail 索引紧跟 vocab 区间，`total_num_embeddings = vocab_num_embeddings + hash_bucket`
 3. **Missing value 统一为 1.0**：multi-hot 和 single-hot 的缺失值均为 1.0，便于 weighted pooling
 4. **OOV 统计**：仅 vocab/hybrid-head 实际 OOV 计入统计，hash 编码不报告 OOV
+
+
+## DeepFM Backbone Smoke Run
+
+- 配置文件：`configs/models/backbone_deepfm.yaml`
+- 运行命令：
+  ```bash
+  python -m src.train.run_backbone_deepfm --config configs/model/backbone_deepfm.yaml
+  ```
+- 预期输出：运行 `runtime.steps` 个 batch（默认 1），日志包含 `h shape=(batch_size, out_dim)`，默认形状为 `(128, 128)`，完成后正常退出。
+
+## Train: DeepFM + SharedBottom test
+
+训练 1~2 个 epoch（单机单卡/CPU）：
+
+```bash
+python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train.yaml
+```## Phase 5 Eval (AUC/LogLoss/ECE/Funnel
+- 新增评估模块：src/eval/metrics.py, src/train/infer.py, src/eval/calibration.py, src/eval/funnel.py 
+- CVR 指标按 click_mask 过滤（仅在点击样本上计算） 
+- 若未安装 sklearn，AUC 字段为 null，程序不会报错 )

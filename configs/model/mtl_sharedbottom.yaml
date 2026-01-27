@@ -1,0 +1,11 @@
+model:
+  name: "deepfm_shared_bottom"
+  tasks: ["ctr", "cvr"]
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    ctr: {}
+    cvr: {}

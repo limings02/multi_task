@@ -194,4 +194,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-level", type=str, default=None, help="Set log level (INFO/DEBUG/WARN). Overrides LOGLEVEL env."
     )
 
+    train_parser = subparsers.add_parser("train", help="Train DeepFM SharedBottom model.")
+    train_parser.add_argument(
+        "--config", type=str, default="configs/experiments/deepfm_sharedbottom_train.yaml", help="Experiment config."
+    )
+
+    eval_parser = subparsers.add_parser("eval", help="Evaluate a trained checkpoint.")
+    eval_parser.add_argument(
+        "--config", type=str, default="configs/experiments/deepfm_sharedbottom_train.yaml", help="Experiment config."
+    )
+    eval_parser.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint file.")
+    eval_parser.add_argument("--split", type=str, default="valid", help="Dataset split to evaluate.")
+    eval_parser.add_argument("--run-dir", type=str, default=None, help="Run directory to place eval outputs.")
+    eval_parser.add_argument(
+        "--save-preds",
+        action="store_true",
+        help="If set, write predictions parquet (preds_<split>.parquet) alongside eval.json.",
+    )
+    eval_parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help="Optional cap on number of batches for quick smoke evaluation.",
+    )
+
     return parser

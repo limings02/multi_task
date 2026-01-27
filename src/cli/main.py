@@ -16,6 +16,9 @@ from src.data.token_filter import build_rowid_membership, filter_tokens_by_rowid
 from src.data.processed_builder import build_processed_dataset
 from src.eda.aliccp_eda import run_eda_aliccp
 from src.eda.extra import run_eda_extra
+from src.eval.run_eval import run_eval
+from src.train.trainer import Trainer
+from src.utils.config import load_yaml
 
 
 def _collect_overrides(args) -> Dict[str, object]:
@@ -258,6 +261,27 @@ def main():
         )
         logger.info("Process completed. output=%s", result.get("processed_root"))
         print(json.dumps(result, indent=2))
+    elif args.command == "train":
+        cfg = load_yaml(args.config)
+        trainer = Trainer(cfg)
+        trainer.run()
+    elif args.command == "eval":
+        cfg = load_yaml(args.config)
+        result = run_eval(
+            cfg=cfg,
+            split=args.split,
+            ckpt_path=args.ckpt,
+            run_dir=args.run_dir,
+            save_preds=bool(args.save_preds),
+            max_batches=args.max_batches,
+            logger=logger,
+        )
+        print(
+            json.dumps(
+                {"eval_json": str(Path(result["run_dir"]) / "eval.json"), "summary": result},
+                indent=2,
+            )
+        )
     else:  # pragma: no cover - argparse guards this
         parser.print_help()
 
