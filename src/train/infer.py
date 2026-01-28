@@ -46,12 +46,13 @@ def infer_to_parquet(
     max_batches: Optional[int] = None,
     include_ctcvr: bool = True,
     split: Optional[str] = None,
+    enabled_heads: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Run inference and stream predictions to Parquet.
 
     Args:
-        model: PyTorch model with "ctr" and "cvr" outputs.
+        model: PyTorch model whose outputs follow enabled_heads (e.g., "ctr", "cvr").
         loader: DataLoader yielding (labels, features, meta).
         device: torch.device to run inference on.
         out_path: output Parquet file path.
@@ -62,6 +63,9 @@ def infer_to_parquet(
     model.eval()
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    heads = {h.lower() for h in (enabled_heads or ["ctr", "cvr"])}
+    use_ctr = "ctr" in heads
+    use_cvr = "cvr" in heads
 
     writer: Optional[pq.ParquetWriter] = None
     rows_written = 0
@@ -76,33 +80,39 @@ def infer_to_parquet(
             features_dev = _to_device_features(features, device)
 
             outputs = model(features_dev)
-            ctr_logit = outputs["ctr"]
-            cvr_logit = outputs["cvr"]
+            ctr_logit = outputs.get("ctr")
+            cvr_logit = outputs.get("cvr")
 
-            # Normalize shapes to (B,)
-            if ctr_logit.dim() > 1:
+            # Normalize shapes to (B,) when present
+            if ctr_logit is not None and ctr_logit.dim() > 1:
                 ctr_logit = ctr_logit.view(-1)
-            if cvr_logit.dim() > 1:
+            if cvr_logit is not None and cvr_logit.dim() > 1:
                 cvr_logit = cvr_logit.view(-1)
 
-            pred_ctr_prob = torch.sigmoid(ctr_logit).cpu().numpy()
-            pred_cvr_prob = torch.sigmoid(cvr_logit).cpu().numpy()
+            pred_ctr_prob = torch.sigmoid(ctr_logit).cpu().numpy() if ctr_logit is not None else None
+            pred_cvr_prob = torch.sigmoid(cvr_logit).cpu().numpy() if cvr_logit is not None else None
 
-            batch_size = pred_ctr_prob.shape[0]
+            # Derive batch size from any available tensor to keep consistent
+            ref_tensor = ctr_logit if ctr_logit is not None else cvr_logit
+            if ref_tensor is None:
+                continue
+            batch_size = ref_tensor.shape[0]
             data = {
                 "entity_id": meta["entity_id"],  # already list[str]
                 "row_id": labels_dev["row_id"].cpu().numpy(),
                 "y_ctr": labels_dev["y_ctr"].cpu().numpy(),
                 "y_cvr": labels_dev["y_cvr"].cpu().numpy(),
                 "click_mask": labels_dev["click_mask"].cpu().numpy(),
-                "pred_ctr": pred_ctr_prob.astype(np.float32),
-                "pred_cvr": pred_cvr_prob.astype(np.float32),
             }
+            if use_ctr and pred_ctr_prob is not None:
+                data["pred_ctr"] = pred_ctr_prob.astype(np.float32)
+            if use_cvr and pred_cvr_prob is not None:
+                data["pred_cvr"] = pred_cvr_prob.astype(np.float32)
             # y_ctcvr is optional but keep if present for funnel analysis
             if "y_ctcvr" in labels_dev:
                 data["y_ctcvr"] = labels_dev["y_ctcvr"].cpu().numpy()
 
-            if include_ctcvr:
+            if include_ctcvr and use_ctr and use_cvr and pred_ctr_prob is not None and pred_cvr_prob is not None:
                 data["pred_ctcvr"] = (pred_ctr_prob * pred_cvr_prob).astype(np.float32)
 
             table = pa.Table.from_pydict(data)

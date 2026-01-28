@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import torch
 from torch import nn
@@ -14,12 +14,15 @@ class SharedBottom(nn.Module):
     and attaches per-task towers while preserving the wide (linear) term.
     """
 
-    def __init__(self, backbone: nn.Module, head_cfg: Dict):
+    def __init__(self, backbone: nn.Module, head_cfg: Dict, enabled_heads: Optional[List[str]] = None):
         super().__init__()
         self.backbone = backbone
 
         tasks = head_cfg.get("tasks") or ["ctr", "cvr"]
         self.tasks: List[str] = tasks
+        # Enabled heads are a subset (or equal) of all tasks; default to all tasks.
+        enabled = enabled_heads or tasks
+        self.enabled_heads: Set[str] = {h.lower() for h in enabled}
 
         self._head_cfg_resolved: Dict[str, Dict[str, object]] = {}
 
@@ -93,10 +96,15 @@ class SharedBottom(nn.Module):
             raise ValueError(f"logit_linear must broadcast to [B]; got shape {tuple(linear.shape)}")
 
         results: Dict[str, torch.Tensor] = {}
-        # Keep wide (linear) contribution for every task logit to retain DeepFM's wide+deep benefits.
+        # Keep wide (linear) contribution for each enabled task logit to retain DeepFM's wide+deep benefits.
         for task, head in self.towers.items():
+            if task not in self.enabled_heads:
+                continue
             task_logit = head(h) + linear
             results[task] = task_logit
+        # Propagate optional auxiliary signals for debugging/analysis.
+        if "aux" in out:
+            results["aux"] = out["aux"]
         return results
 
 

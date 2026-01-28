@@ -263,7 +263,7 @@ def main():
         print(json.dumps(result, indent=2))
     elif args.command == "train":
         cfg = load_yaml(args.config)
-        trainer = Trainer(cfg)
+        trainer = Trainer(cfg, config_path=args.config)
         trainer.run()
     elif args.command == "eval":
         cfg = load_yaml(args.config)
@@ -275,6 +275,7 @@ def main():
             save_preds=bool(args.save_preds),
             max_batches=args.max_batches,
             logger=logger,
+            config_path=args.config,
         )
         print(
             json.dumps(

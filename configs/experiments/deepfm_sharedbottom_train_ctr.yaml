@@ -19,8 +19,8 @@ embedding:
 
 model:
   name: "deepfm_shared_bottom"
-  enabled_heads: ["ctr","cvr"]
-  tasks: ["ctr", "cvr"]
+  enabled_heads: ["ctr"]
+  tasks: ["ctr"]
   heads:
     default:
       mlp_dims: [128]
@@ -51,11 +51,11 @@ loss:
 runtime:
   device: "cuda"
   epochs: 1
-  log_every: 10
+  log_every: 1000
   amp: true
-  grad_diag_enabled: true
-  max_train_steps: 50  # smoke
-  max_valid_steps: 3  # smoke
+  grad_diag_enabled: false
+  max_train_steps: 5000  # smoke
+  max_valid_steps: 300  # smoke
   grad_clip_norm: null
   seed: 20260127
   resume_path: null

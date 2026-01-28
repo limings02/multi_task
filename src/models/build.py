@@ -54,6 +54,7 @@ def build_model(cfg: Dict[str, Any], feature_map: Dict[str, Any] | None = None, 
     Assemble model according to cfg. Currently supports only DeepFM + SharedBottom.
     """
     model_cfg = cfg.get("model", {})
+    enabled_heads = model_cfg.get("enabled_heads") or ["ctr", "cvr"]
     name = model_cfg.get("name") or "deepfm_shared_bottom"
     if name != "deepfm_shared_bottom":
         raise NotImplementedError(f"Only 'deepfm_shared_bottom' is supported, got '{name}'.")
@@ -69,7 +70,7 @@ def build_model(cfg: Dict[str, Any], feature_map: Dict[str, Any] | None = None, 
     head_cfg["default"].setdefault("use_bn", model_cfg.get("head_use_bn", False))
     head_cfg["default"].setdefault("activation", model_cfg.get("head_activation", model_cfg.get("deep_activation", "relu")))
 
-    return SharedBottom(backbone=backbone, head_cfg=head_cfg)
+    return SharedBottom(backbone=backbone, head_cfg=head_cfg, enabled_heads=enabled_heads)
 
 
 __all__ = ["build_model"]

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
-import json
 
 import numpy as np
 import torch
-from torch import optim
+from torch import optim, amp as torch_amp
 import yaml
 
 from src.core.checkpoint import load_checkpoint, save_checkpoint
@@ -23,12 +23,15 @@ from src.utils.feature_meta import build_model_feature_meta
 
 
 def _setup_logger(log_path: Path) -> logging.Logger:
-    logger = logging.getLogger(f"trainer_{log_path}")
+    # 确保使用绝对路径，避免 subprocess 环境下相对路径解析问题
+    log_path = Path(log_path).resolve()
+    logger = logging.getLogger(f"trainer_{log_path.name}")
     logger.setLevel(logging.INFO)
     logger.handlers = []
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    fh = logging.FileHandler(log_path)
+    # Windows 下明确指定 encoding 和绝对路径
+    fh = logging.FileHandler(str(log_path), encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
@@ -46,12 +49,42 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _resolve_enabled_heads(model_cfg: Dict[str, Any]) -> list[str]:
+    heads = model_cfg.get("enabled_heads") or model_cfg.get("tasks")
+    if not heads:
+        heads = ["ctr", "cvr"]
+    return sorted([str(h).lower() for h in heads])
+
+
+def get_exp_tags(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Unified experiment identifier used in every metrics.jsonl row.
+    """
+    model_cfg = cfg.get("model", {})
+    model_name = model_cfg.get("name", "unknown_model")
+    enabled = model_cfg.get("enabled_heads") or model_cfg.get("tasks") or ["ctr", "cvr"]
+    enabled = sorted([str(h).lower() for h in enabled])
+    exp_name = f"{model_name}__heads={'-'.join(enabled)}"
+    seed = cfg.get("data", {}).get("seed", cfg.get("runtime", {}).get("seed"))
+    return {"model_name": model_name, "enabled_heads": enabled, "exp_name": exp_name, "seed": seed}
+
+
 class Trainer:
-    def __init__(self, cfg: Dict[str, Any]):
+    def __init__(self, cfg: Dict[str, Any], config_path: Optional[str | Path] = None):
         self.cfg = cfg
+        self.config_path = Path(config_path).resolve() if config_path else None
+
+        tags = get_exp_tags(cfg)
+        self.enabled_heads = tags["enabled_heads"]
+        self.model_name = tags["model_name"]
+        self.exp_name = tags["exp_name"]
+        self.seed_value = tags["seed"]
+        self.metrics_meta = {**tags, "config_path": str(self.config_path) if self.config_path else None}
         exp_name = cfg.get("experiment", {}).get("name", "exp")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = Path("runs") / f"{exp_name}_{ts}"
+        # 使用绝对路径，避免 subprocess 环境下 cwd 不一致导致日志写入失败
+        project_root = Path(__file__).resolve().parent.parent.parent
+        self.run_dir = (project_root / "runs" / f"{exp_name}_{ts}").resolve()
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
         # Save config snapshot
@@ -64,6 +97,16 @@ class Trainer:
         _set_seed(seed)
 
         self.device = torch.device(cfg.get("runtime", {}).get("device", "cpu"))
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            # Keep training runnable on machines without CUDA; AMP will be disabled automatically.
+            self.device = torch.device("cpu")
+            logging.getLogger(__name__).warning("CUDA requested but not available; falling back to CPU and disabling AMP.")
+        runtime_cfg = cfg.get("runtime", {})
+        self.amp_enabled = bool(runtime_cfg.get("amp", False)) and self.device.type == "cuda"
+        self.amp_dtype = torch.float16
+        self.amp_device_type = self.device.type
+        # GradScaler keeps fp32 master weights while applying scaled grads; disabled on CPU automatically.
+        self.scaler = torch_amp.GradScaler(enabled=self.amp_enabled, device="cuda")
 
         # feature_meta for dataloader/model
         metadata_path = Path(cfg["data"]["metadata_path"])
@@ -111,6 +154,7 @@ class Trainer:
             w_ctr=float(loss_cfg.get("w_ctr", 1.0)),
             w_cvr=float(loss_cfg.get("w_cvr", 1.0)),
             eps=float(loss_cfg.get("eps", 1e-6)),
+            enabled_heads=self.enabled_heads,
         )
 
         self.best_metric: float = float("inf")
@@ -124,8 +168,16 @@ class Trainer:
             self.logger.info(f"Resumed from {resume_path}, step={self.global_step}, best_metric={self.best_metric}")
 
     def _write_metrics(self, metrics: Dict[str, Any]) -> None:
+        payload = {
+            **self.metrics_meta,
+            "amp_enabled": self.amp_enabled,
+            "amp_dtype": "fp16" if self.amp_enabled else "none",
+            **metrics,
+        }
+        if self.amp_enabled and hasattr(self, "scaler") and self.scaler is not None:
+            payload["scaler_scale"] = float(self.scaler.get_scale())
         with (self.run_dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(metrics) + "\n")
+            f.write(json.dumps(payload) + "\n")
 
     def run(self) -> None:
         runtime = self.cfg.get("runtime", {})
@@ -134,8 +186,41 @@ class Trainer:
         max_train_steps = runtime.get("max_train_steps")
         max_valid_steps = runtime.get("max_valid_steps")
         grad_clip_norm = runtime.get("grad_clip_norm")
+        grad_diag_enabled = bool(runtime.get("grad_diag_enabled", False))
+        eval_every_steps = log_every  # user request: validate every log_every steps
 
         for epoch in range(1, epochs + 1):
+            def _validate_once():
+                return validate(
+                    self.model,
+                    self.valid_loader,
+                    self.loss_fn,
+                    self.device,
+                    self.logger,
+                    epoch=epoch,
+                    max_steps=max_valid_steps,
+                    log_every=max(1, log_every * 4),
+                    amp_enabled=self.amp_enabled,
+                    amp_dtype=self.amp_dtype,
+                    amp_device_type=self.amp_device_type,
+                )
+
+            def _on_eval(val_metrics: Dict[str, Any], g_step: int, ep: int) -> None:
+                record = {"epoch": ep, "split": "valid", "global_step": g_step, **val_metrics}
+                self._write_metrics(record)
+                if val_metrics and val_metrics.get("loss_total") is not None and val_metrics["loss_total"] < self.best_metric:
+                    self.best_metric = val_metrics["loss_total"]
+                    save_checkpoint(
+                        self.run_dir / "ckpt_best.pt",
+                        self.model,
+                        self.optimizer,
+                        cfg=self.cfg,
+                        step=g_step,
+                        best_metric=self.best_metric,
+                        extra={"epoch": ep},
+                    )
+                    self.logger.info(f"New best at step {g_step}: loss_total={self.best_metric:.4f}")
+
             train_metrics = train_one_epoch(
                 self.model,
                 self.train_loader,
@@ -147,6 +232,15 @@ class Trainer:
                 max_steps=max_train_steps,
                 grad_clip_norm=grad_clip_norm,
                 log_every=log_every,
+                global_step=self.global_step,
+                grad_diag_enabled=grad_diag_enabled,
+                eval_every_steps=eval_every_steps,
+                validate_fn=_validate_once,
+                eval_callback=_on_eval,
+                amp_enabled=self.amp_enabled,
+                amp_dtype=self.amp_dtype,
+                scaler=self.scaler,
+                amp_device_type=self.amp_device_type,
             )
             self.global_step += train_metrics.get("steps", 0)
             train_record = {"epoch": epoch, "split": "train", **train_metrics}
@@ -161,6 +255,8 @@ class Trainer:
                 epoch=epoch,
                 max_steps=max_valid_steps,
                 log_every=log_every * 4,
+                amp_enabled=self.amp_enabled,
+                amp_dtype=self.amp_dtype,
             )
             valid_record = {"epoch": epoch, "split": "valid", **valid_metrics}
             self._write_metrics(valid_record)
@@ -203,6 +299,7 @@ class Trainer:
             self.logger.info(
                 "Auto-eval starting on split=%s using %s (save_preds=%s)", split, ckpt_name, save_preds
             )
+            eval_config_path = self.config_path or (self.run_dir / "config.yaml")
             run_eval(
                 cfg=self.cfg,
                 split=split,
@@ -211,6 +308,7 @@ class Trainer:
                 save_preds=save_preds,
                 max_batches=None,
                 logger=self.logger,
+                config_path=eval_config_path,
             )
 
 

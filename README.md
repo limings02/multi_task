@@ -161,11 +161,13 @@ train_loader = build_dataloader(
 - 预期输出：运行 `runtime.steps` 个 batch（默认 1），日志包含 `h shape=(batch_size, out_dim)`，默认形状为 `(128, 128)`，完成后正常退出。
 
 ## Train: DeepFM + SharedBottom test
-
+ 
 训练 1~2 个 epoch（单机单卡/CPU）：
 
 ```bash
 python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train.yaml
+python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train_ctr.yaml
+python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train_cvr.yaml
 ```## Phase 5 Eval (AUC/LogLoss/ECE/Funnel
 - 新增评估模块：src/eval/metrics.py, src/train/infer.py, src/eval/calibration.py, src/eval/funnel.py 
 - CVR 指标按 click_mask 过滤（仅在点击样本上计算） 
