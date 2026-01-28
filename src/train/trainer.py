@@ -23,15 +23,12 @@ from src.utils.feature_meta import build_model_feature_meta
 
 
 def _setup_logger(log_path: Path) -> logging.Logger:
-    # 确保使用绝对路径，避免 subprocess 环境下相对路径解析问题
-    log_path = Path(log_path).resolve()
-    logger = logging.getLogger(f"trainer_{log_path.name}")
+    logger = logging.getLogger(f"trainer_{log_path}")
     logger.setLevel(logging.INFO)
     logger.handlers = []
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    # Windows 下明确指定 encoding 和绝对路径
-    fh = logging.FileHandler(str(log_path), encoding="utf-8")
+    fh = logging.FileHandler(log_path)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
@@ -82,9 +79,7 @@ class Trainer:
         self.metrics_meta = {**tags, "config_path": str(self.config_path) if self.config_path else None}
         exp_name = cfg.get("experiment", {}).get("name", "exp")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # 使用绝对路径，避免 subprocess 环境下 cwd 不一致导致日志写入失败
-        project_root = Path(__file__).resolve().parent.parent.parent
-        self.run_dir = (project_root / "runs" / f"{exp_name}_{ts}").resolve()
+        self.run_dir = Path("runs") / f"{exp_name}_{ts}"
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
         # Save config snapshot
