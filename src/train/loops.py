@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch import amp as torch_amp
+from src.eval.metrics import compute_binary_metrics
 
 EPS = 1e-12
 
@@ -97,6 +98,7 @@ def train_one_epoch(
     amp_dtype: torch.dtype = torch.float16,
     scaler: Optional[torch_amp.GradScaler] = None,
     amp_device_type: str = "cuda",
+    debug_logit_every: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Train for one epoch and emit aggregated metrics plus optional gradient diagnostics.
@@ -144,19 +146,101 @@ def train_one_epoch(
             batch = {"labels": labels, "features": features_dev, "meta": meta}
             loss, loss_dict = loss_fn.compute(outputs, batch)
 
-        if amp_enabled and scaler is not None:
-            scaler.scale(loss).backward()
-            if grad_clip_norm is not None:
-                # unscale before clipping, otherwise clipping would operate on scaled grads.
-                scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), grad_clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
+        # Debug-only logit stats (no effect on gradients).
+        current_global_step = global_step + steps + 1
+        should_debug_logits = (
+            debug_logit_every is not None
+            and debug_logit_every > 0
+            and (current_global_step % debug_logit_every == 0 or current_global_step == 1)
+        )
+        if should_debug_logits and hasattr(logger, "info"):
+            with torch.no_grad():
+                def _stats(t: Optional[torch.Tensor]):
+                    if t is None:
+                        return None
+                    flat = t.detach().float().reshape(-1)
+                    if flat.numel() == 0:
+                        return None
+                    qs = torch.quantile(flat, torch.tensor([0.99, 0.999], device=flat.device))
+                    return {
+                        "mean": float(flat.mean().item()),
+                        "std": float(flat.std().item()),
+                        "abs_max": float(flat.abs().max().item()),
+                        "p99": float(qs[0].item()),
+                        "p999": float(qs[1].item()),
+                    }
+
+                ctr_logit = outputs.get("ctr")
+                ctr_parts = outputs.get("ctr_logit_parts", {}) if isinstance(outputs, dict) else {}
+                fm_logit = ctr_parts.get("fm")
+                wide_logit = ctr_parts.get("wide")
+                deep_logit = ctr_parts.get("deep")
+                stats_total = _stats(ctr_logit)
+                stats_fm = _stats(fm_logit)
+                stats_wide = _stats(wide_logit)
+                stats_deep = _stats(deep_logit)
+
+                # Per-field wide debug collected inside backbone when enabled.
+                linear_debug = getattr(getattr(model, "backbone", model), "last_linear_debug", None)
+                fm_debug = getattr(getattr(model, "backbone", model), "last_fm_debug", None)
+                log_parts = [
+                    f"[dbg_logit] step={current_global_step}",
+                    f"ctr_total={stats_total}",
+                    f"wide={stats_wide}",
+                    f"fm={stats_fm}",
+                    f"deep={stats_deep}",
+                ]
+                if linear_debug:
+                    log_parts.append(f"wide_fields={linear_debug}")
+                if fm_debug:
+                    log_parts.append(f"fm_stats={fm_debug}")
+                pos_w = {
+                    "pos_weight_ctr": loss_dict.get("pos_weight_ctr"),
+                    "pos_weight_cvr": loss_dict.get("pos_weight_cvr"),
+                    "ctr_pos_rate": float(labels["y_ctr"].mean().item()),
+                    "cvr_pos_rate": float(labels["y_cvr"].mean().item()),
+                }
+                log_parts.append(f"labels={pos_w}")
+                logger.info(" ".join(log_parts))
+
+        mask_cvr_sum_val_raw = loss_dict.get("mask_cvr_sum", None)
+        mask_cvr_sum_val = None
+        if mask_cvr_sum_val_raw is not None:
+            if isinstance(mask_cvr_sum_val_raw, torch.Tensor):
+                mask_cvr_sum_val = float(mask_cvr_sum_val_raw.item())
+            else:
+                mask_cvr_sum_val = float(mask_cvr_sum_val_raw)
+
+        log_loss_debug = ((step + 1) % log_every == 0) or not loss.requires_grad
+        if log_loss_debug and hasattr(logger, "debug"):
+            logger.debug(
+                "loss_debug step=%d type=%s requires_grad=%s device=%s mask_cvr_sum=%s enabled_heads=%s",
+                step + 1,
+                type(loss).__name__,
+                getattr(loss, "requires_grad", None),
+                getattr(loss, "device", None),
+                mask_cvr_sum_val_raw,
+                enabled_heads,
+            )
+
+        skip_cvr_only_empty_mask = has_cvr and (not has_ctr) and (mask_cvr_sum_val == 0.0)
+        if skip_cvr_only_empty_mask:
+            if log_loss_debug and hasattr(logger, "debug"):
+                logger.debug("skip backward/step at step=%d because mask_cvr_sum==0 in CVR-only batch", step + 1)
         else:
-            loss.backward()
-            if grad_clip_norm is not None:
-                clip_grad_norm_(model.parameters(), grad_clip_norm)
-            optimizer.step()
+            if amp_enabled and scaler is not None:
+                scaler.scale(loss).backward()
+                if grad_clip_norm is not None:
+                    # unscale before clipping, otherwise clipping would operate on scaled grads.
+                    scaler.unscale_(optimizer)
+                    clip_grad_norm_(model.parameters(), grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if grad_clip_norm is not None:
+                    clip_grad_norm_(model.parameters(), grad_clip_norm)
+                optimizer.step()
 
         # aggregate stats
         B = int(labels["y_ctr"].shape[0])
@@ -184,7 +268,6 @@ def train_one_epoch(
             cvr_scaled_count += 1
         steps += 1
 
-        current_global_step = global_step + steps
         should_sample_grad = (
             grad_diag_enabled
             and has_ctr
@@ -317,6 +400,7 @@ def validate(
     amp_enabled: bool = False,
     amp_dtype: torch.dtype = torch.float16,
     amp_device_type: str = "cuda",
+    calc_auc: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     enabled_heads = getattr(loss_fn, "enabled_heads", {"ctr", "cvr"})
@@ -333,6 +417,12 @@ def validate(
     n_masked = 0.0
     pos_masked = 0.0
     t_start = time.time()
+
+    y_ctr_list: List[torch.Tensor] = []
+    y_cvr_list: List[torch.Tensor] = []
+    click_mask_list: List[torch.Tensor] = []
+    ctr_logit_list: List[torch.Tensor] = []
+    cvr_logit_list: List[torch.Tensor] = []
 
     with torch.no_grad():
         for step, (labels, features, meta) in enumerate(loader):
@@ -353,6 +443,21 @@ def validate(
                 mask = labels["click_mask"]
                 n_masked += float(mask.sum().item())
                 pos_masked += float((labels["y_cvr"] * (mask > 0.5)).sum().item())
+
+            if calc_auc:
+                if has_ctr:
+                    ctr_logit = outputs["ctr"]
+                    if ctr_logit.dim() > 1:
+                        ctr_logit = ctr_logit.view(-1)
+                    ctr_logit_list.append(ctr_logit.detach().cpu())
+                    y_ctr_list.append(labels["y_ctr"].detach().cpu())
+                if has_cvr:
+                    cvr_logit = outputs["cvr"]
+                    if cvr_logit.dim() > 1:
+                        cvr_logit = cvr_logit.view(-1)
+                    cvr_logit_list.append(cvr_logit.detach().cpu())
+                    y_cvr_list.append(labels["y_cvr"].detach().cpu())
+                    click_mask_list.append(labels["click_mask"].detach().cpu())
 
             tot_loss += loss_dict["loss_total"]
             tot_ctr += loss_dict.get("loss_ctr", 0.0)
@@ -404,6 +509,29 @@ def validate(
     if mean_ctr_scaled is not None and mean_cvr_scaled is not None:
         loss_ratio_scaled = float(mean_cvr_scaled / (mean_ctr_scaled + EPS))
 
+    auc_ctr = auc_cvr = auc_primary = None
+    if calc_auc:
+        auc_vals = []
+        if has_ctr and y_ctr_list:
+            ctr_metrics = compute_binary_metrics(
+                torch.cat(y_ctr_list).numpy(), torch.cat(ctr_logit_list).numpy()
+            )
+            auc_ctr = ctr_metrics.get("auc")
+            if auc_ctr is not None:
+                auc_vals.append(auc_ctr)
+        if has_cvr and y_cvr_list:
+            mask_arr = torch.cat(click_mask_list).numpy()
+            cvr_metrics = compute_binary_metrics(
+                torch.cat(y_cvr_list).numpy(),
+                torch.cat(cvr_logit_list).numpy(),
+                mask=mask_arr > 0.5,
+            )
+            auc_cvr = cvr_metrics.get("auc")
+            if auc_cvr is not None:
+                auc_vals.append(auc_cvr)
+        if auc_vals:
+            auc_primary = float(sum(auc_vals) / len(auc_vals))
+
     return {
         "loss_total": tot_loss / steps,
         "loss_ctr": mean_ctr if has_ctr else 0.0,
@@ -427,6 +555,9 @@ def validate(
         "grad_cosine_p10": None,
         "grad_cosine_p50": None,
         "grad_cosine_p90": None,
+        "auc_ctr": auc_ctr,
+        "auc_cvr": auc_cvr,
+        "auc_primary": auc_primary,
     }
 
 

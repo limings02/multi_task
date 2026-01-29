@@ -10,7 +10,9 @@ from src.models.backbones.layers import FeatureEmbedding, MLP
 
 class DeepFMBackbone(nn.Module):
     """
-    DeepFM backbone that outputs shared representation h (no task heads).
+    DeepFM backbone that can operate in two modes:
+    - legacy "pseudo DeepFM": concat(deep_h, fm_vec) -> out_proj -> task heads (existing behaviour)
+    - classic DeepFM baseline: expose wide_logit, fm_logit (eq-weight sum), deep_h for explicit logit decomposition
     """
 
     def __init__(
@@ -23,11 +25,18 @@ class DeepFMBackbone(nn.Module):
         fm_enabled: bool = True,
         fm_projection_dim: Optional[int] = None,
         out_dim: int = 128,
+        use_legacy_pseudo_deepfm: bool = True,
+        return_logit_parts: bool = False,
     ):
         super().__init__()
         self.feature_meta = feature_meta
         self.feat_emb = FeatureEmbedding(feature_meta)
         self.field_names_sorted: List[str] = sorted(feature_meta.keys())
+        # Debug flags (set externally, e.g., in Trainer) – no effect on forward outputs.
+        self.debug_linear: bool = False
+        self.debug_fm: bool = False
+        self.last_linear_debug: Optional[Dict[str, Any]] = None
+        self.last_fm_debug: Optional[Dict[str, Any]] = None
 
         # Deep component
         self.deep_mlp = MLP(
@@ -70,6 +79,7 @@ class DeepFMBackbone(nn.Module):
         final_in_dim = self.deep_mlp.output_dim + (self.fm_dim if self.fm_enabled else 0)
         self.out_proj = nn.Linear(final_in_dim, out_dim)
         self.out_dim = out_dim
+        self.deep_out_dim = self.deep_mlp.output_dim
 
         # Linear (first-order) component: true sparse linear via EmbeddingBag
         self.linear_bags = nn.ModuleDict(
@@ -88,6 +98,9 @@ class DeepFMBackbone(nn.Module):
         for emb in self.linear_bags.values():
             nn.init.normal_(emb.weight, mean=0.0, std=0.01)
 
+        self.use_legacy_pseudo_deepfm = bool(use_legacy_pseudo_deepfm)
+        self.return_logit_parts = bool(return_logit_parts)
+
     def _compute_fm(self, embedding_out: Dict[str, Any]) -> torch.Tensor:
         field_names = embedding_out["field_names"]
         emb_dict = embedding_out["emb_dict"]
@@ -104,6 +117,10 @@ class DeepFMBackbone(nn.Module):
         sum_square = sum_emb * sum_emb
         square_sum = (fm_stack * fm_stack).sum(dim=1)
         fm_vec = 0.5 * (sum_square - square_sum)
+        # Normalize by field count to prevent explosion when there are many features.
+        num_fields = float(fm_stack.shape[1]) if fm_stack is not None else float(len(field_names))
+        if num_fields > 0:
+            fm_vec = fm_vec / num_fields
         return fm_vec
 
     def _compute_linear(self, features: Dict[str, Any]) -> torch.Tensor:
@@ -123,6 +140,7 @@ class DeepFMBackbone(nn.Module):
 
         device = self.linear_bags[first_base].weight.device
         logit = torch.zeros((B, 1), device=device, dtype=self.linear_bags[first_base].weight.dtype)
+        debug_stats: Dict[str, Any] = {} if self.debug_linear else None
 
         for base in field_names:
             fd = fields[base]
@@ -153,6 +171,28 @@ class DeepFMBackbone(nn.Module):
                 bag_out = bag_out / lengths.unsqueeze(-1)
             logit = logit + bag_out
 
+            if debug_stats is not None:
+                flat = bag_out.detach().view(-1)
+                l_flat = lengths.detach().view(-1)
+                stat = {
+                    "abs_max": float(flat.abs().max().item()) if flat.numel() else 0.0,
+                    "p99": float(torch.quantile(flat, torch.tensor(0.99, device=flat.device)).item()) if flat.numel() else 0.0,
+                    "mean": float(flat.mean().item()) if flat.numel() else 0.0,
+                    "std": float(flat.std().item()) if flat.numel() else 0.0,
+                    "len_p90": float(torch.quantile(l_flat, torch.tensor(0.90, device=l_flat.device)).item()) if l_flat.numel() else 0.0,
+                    "len_p99": float(torch.quantile(l_flat, torch.tensor(0.99, device=l_flat.device)).item()) if l_flat.numel() else 0.0,
+                    "len_max": float(l_flat.max().item()) if l_flat.numel() else 0.0,
+                }
+                if wts is not None and wts.numel() > 0:
+                    w_flat = wts.detach().view(-1)
+                    stat["w_abs_max"] = float(w_flat.abs().max().item())
+                    stat["w_p99"] = float(torch.quantile(w_flat, torch.tensor(0.99, device=w_flat.device)).item())
+                    stat["w_p999"] = float(torch.quantile(w_flat, torch.tensor(0.999, device=w_flat.device)).item())
+                debug_stats[base] = stat
+
+        if debug_stats is not None:
+            self.last_linear_debug = debug_stats
+
         return logit
 
     def forward(
@@ -167,22 +207,58 @@ class DeepFMBackbone(nn.Module):
         emb_out = self.feat_emb(features)
         deep_h = self.deep_mlp(emb_out["emb_concat"])
 
-        parts = [deep_h]
-        if self.fm_enabled:
-            fm_vec = self._compute_fm(emb_out)
-            parts.append(fm_vec)
+        # ----- Legacy pseudo-DeepFM path (existing behaviour) -----
+        if self.use_legacy_pseudo_deepfm:
+            parts = [deep_h]
+            if self.fm_enabled:
+                fm_vec = self._compute_fm(emb_out)
+                parts.append(fm_vec)
+            else:
+                fm_vec = None
 
-        h = torch.cat(parts, dim=1)
-        h_out = self.out_proj(h)
+            h = torch.cat(parts, dim=1)
+            h_out = self.out_proj(h)
+
+            if not return_aux:
+                return h_out
+
+            linear_logit = self._compute_linear(features)
+            out = {"h": h_out, "logit_linear": linear_logit, "deep_h": deep_h}
+            if fm_vec is not None:
+                out["fm_vec"] = fm_vec
+            # legacy mode keeps behaviour; decomposition handled upstream if requested
+            return out
+
+        # ----- Classic DeepFM baseline path -----
+        fm_vec = self._compute_fm(emb_out) if self.fm_enabled else None
+        fm_logit = None
+        if fm_vec is not None:
+            # Expect shape [B, D]; sum over embedding dim to get scalar fm logit
+            fm_logit = fm_vec.sum(dim=1, keepdim=True)
+        if self.debug_fm and fm_vec is not None:
+            flat = fm_logit.detach().view(-1) if fm_logit is not None else fm_vec.detach().view(-1)
+            if flat.numel() > 0:
+                qs = torch.quantile(flat, torch.tensor([0.99, 0.999], device=flat.device))
+                self.last_fm_debug = {
+                    "abs_max": float(flat.abs().max().item()),
+                    "p99": float(qs[0].item()),
+                    "p999": float(qs[1].item()),
+                    "mean": float(flat.mean().item()),
+                    "std": float(flat.std().item()),
+                }
+
+        wide_logit = self._compute_linear(features)
 
         if not return_aux:
-            return h_out
+            return deep_h
 
-        fm_vec = parts[1] if self.fm_enabled else None
-        linear_logit = self._compute_linear(features)
-        out = {"h": h_out, "logit_linear": linear_logit}
-        # Optional extras for debugging/ablation
-        out["deep_h"] = deep_h
+        out: Dict[str, torch.Tensor | None] = {
+            "h": deep_h,  # keep key for compatibility; equals deep_h here
+            "deep_h": deep_h,
+            "logit_linear": wide_logit,  # for downstream addition
+            "wide_logit": wide_logit,
+            "fm_logit": fm_logit,
+        }
         if fm_vec is not None:
             out["fm_vec"] = fm_vec
         return out

@@ -102,6 +102,10 @@ class Trainer:
         self.amp_device_type = self.device.type
         # GradScaler keeps fp32 master weights while applying scaled grads; disabled on CPU automatically.
         self.scaler = torch_amp.GradScaler(enabled=self.amp_enabled, device="cuda")
+        self.debug_logit_every = int(runtime_cfg.get("debug_logit_every", 0) or 0)
+        self.debug_linear_stats = bool(runtime_cfg.get("debug_linear_stats", False))
+        self.debug_fm_stats = bool(runtime_cfg.get("debug_fm_stats", False))
+        self.debug_dataloader_assert = bool(runtime_cfg.get("debug_dataloader_assert", False))
 
         # feature_meta for dataloader/model
         metadata_path = Path(cfg["data"]["metadata_path"])
@@ -118,7 +122,8 @@ class Trainer:
             persistent_workers=bool(cfg["data"].get("persistent_workers", False)),
             seed=cfg["data"].get("seed"),
             feature_meta=self.feature_meta,
-            debug=bool(cfg["data"].get("debug", False)),
+            debug=bool(cfg["data"].get("debug", False) or self.debug_dataloader_assert),
+            neg_keep_prob_train=float(cfg["data"].get("neg_keep_prob_train", 1.0)),
         )
         self.valid_loader = make_dataloader(
             split="valid",
@@ -130,10 +135,16 @@ class Trainer:
             persistent_workers=bool(cfg["data"].get("persistent_workers", False)),
             seed=cfg["data"].get("seed"),
             feature_meta=self.feature_meta,
-            debug=bool(cfg["data"].get("debug", False)),
+            debug=bool(cfg["data"].get("debug", False) or self.debug_dataloader_assert),
         )
 
         self.model = build_model(cfg).to(self.device)
+        # Enable debug hooks on backbone/head if supported.
+        if hasattr(self.model, "backbone"):
+            setattr(self.model.backbone, "debug_linear", self.debug_linear_stats or self.debug_logit_every > 0)
+            setattr(self.model.backbone, "debug_fm", self.debug_fm_stats or self.debug_logit_every > 0)
+        if hasattr(self.model, "debug_logit"):
+            self.model.debug_logit = self.debug_logit_every > 0
 
         opt_cfg = cfg.get("optim", {})
         self.optimizer = optim.AdamW(
@@ -152,7 +163,7 @@ class Trainer:
             enabled_heads=self.enabled_heads,
         )
 
-        self.best_metric: float = float("inf")
+        self.best_metric: float = float("-inf")  # tracks best full AUC
         self.global_step = 0
 
         resume_path = cfg.get("runtime", {}).get("resume_path")
@@ -182,10 +193,11 @@ class Trainer:
         max_valid_steps = runtime.get("max_valid_steps")
         grad_clip_norm = runtime.get("grad_clip_norm")
         grad_diag_enabled = bool(runtime.get("grad_diag_enabled", False))
-        eval_every_steps = log_every  # user request: validate every log_every steps
+        eval_every_steps = log_every  # compute full AUC at the same cadence as logging
+        save_last = bool(runtime.get("save_last", True))
 
         for epoch in range(1, epochs + 1):
-            def _validate_once():
+            def _validate_full():
                 return validate(
                     self.model,
                     self.valid_loader,
@@ -198,13 +210,15 @@ class Trainer:
                     amp_enabled=self.amp_enabled,
                     amp_dtype=self.amp_dtype,
                     amp_device_type=self.amp_device_type,
+                    calc_auc=True,
                 )
 
             def _on_eval(val_metrics: Dict[str, Any], g_step: int, ep: int) -> None:
                 record = {"epoch": ep, "split": "valid", "global_step": g_step, **val_metrics}
                 self._write_metrics(record)
-                if val_metrics and val_metrics.get("loss_total") is not None and val_metrics["loss_total"] < self.best_metric:
-                    self.best_metric = val_metrics["loss_total"]
+                full_auc = val_metrics.get("auc_primary")
+                if full_auc is not None and full_auc > self.best_metric:
+                    self.best_metric = full_auc
                     save_checkpoint(
                         self.run_dir / "ckpt_best.pt",
                         self.model,
@@ -212,9 +226,9 @@ class Trainer:
                         cfg=self.cfg,
                         step=g_step,
                         best_metric=self.best_metric,
-                        extra={"epoch": ep},
+                        extra={"epoch": ep, "kind": "full"},
                     )
-                    self.logger.info(f"New best at step {g_step}: loss_total={self.best_metric:.4f}")
+                    self.logger.info(f"New best at step {g_step}: auc={self.best_metric:.4f}")
 
             train_metrics = train_one_epoch(
                 self.model,
@@ -230,12 +244,13 @@ class Trainer:
                 global_step=self.global_step,
                 grad_diag_enabled=grad_diag_enabled,
                 eval_every_steps=eval_every_steps,
-                validate_fn=_validate_once,
+                validate_fn=_validate_full,
                 eval_callback=_on_eval,
                 amp_enabled=self.amp_enabled,
                 amp_dtype=self.amp_dtype,
                 scaler=self.scaler,
                 amp_device_type=self.amp_device_type,
+                debug_logit_every=self.debug_logit_every,
             )
             self.global_step += train_metrics.get("steps", 0)
             train_record = {"epoch": epoch, "split": "train", **train_metrics}
@@ -252,24 +267,15 @@ class Trainer:
                 log_every=log_every * 4,
                 amp_enabled=self.amp_enabled,
                 amp_dtype=self.amp_dtype,
+                calc_auc=True,
             )
             valid_record = {"epoch": epoch, "split": "valid", **valid_metrics}
             self._write_metrics(valid_record)
 
             # checkpointing
-            save_checkpoint(
-                self.run_dir / "ckpt_last.pt",
-                self.model,
-                self.optimizer,
-                cfg=self.cfg,
-                step=self.global_step,
-                best_metric=self.best_metric,
-                extra={"epoch": epoch},
-            )
-            if valid_metrics and valid_metrics["loss_total"] < self.best_metric:
-                self.best_metric = valid_metrics["loss_total"]
+            if save_last:
                 save_checkpoint(
-                    self.run_dir / "ckpt_best.pt",
+                    self.run_dir / "ckpt_last.pt",
                     self.model,
                     self.optimizer,
                     cfg=self.cfg,
@@ -277,7 +283,20 @@ class Trainer:
                     best_metric=self.best_metric,
                     extra={"epoch": epoch},
                 )
-                self.logger.info(f"New best at epoch {epoch}: loss_total={self.best_metric:.4f}")
+            if valid_metrics:
+                full_auc = valid_metrics.get("auc_primary")
+                if full_auc is not None and full_auc > self.best_metric:
+                    self.best_metric = full_auc
+                    save_checkpoint(
+                        self.run_dir / "ckpt_best.pt",
+                        self.model,
+                        self.optimizer,
+                        cfg=self.cfg,
+                        step=self.global_step,
+                        best_metric=self.best_metric,
+                        extra={"epoch": epoch, "kind": "full"},
+                    )
+                    self.logger.info(f"New best at epoch {epoch}: auc={self.best_metric:.4f}")
 
         self.logger.info("Training finished.")
         # Optional auto-eval after training completes

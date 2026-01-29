@@ -22,7 +22,7 @@ import logging
 from functools import partial
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 # Prefer importing the dataset class; provide a clear error if name changes.
 try:
@@ -227,6 +227,50 @@ def _worker_init_with_seed(worker_id: int, base_seed: int) -> None:
     _seed_worker(worker_id, base_seed)
 
 
+class _SubsetIterDataset(IterableDataset):
+    """
+    Deterministic down-sampling wrapper for IterableDataset.
+    Used to build a small, fixed validation subset for cheap AUC.
+    """
+
+    def __init__(
+        self,
+        base_ds: IterableDataset,
+        subset_ratio: float | None = None,
+        max_samples: int | None = None,
+        seed: int | None = None,
+    ) -> None:
+        if subset_ratio is not None and (subset_ratio <= 0 or subset_ratio > 1):
+            raise ValueError("subset_ratio must be in (0,1].")
+        if max_samples is not None and max_samples <= 0:
+            raise ValueError("max_samples must be positive.")
+        self.base_ds = base_ds
+        self.subset_ratio = subset_ratio
+        self.max_samples = max_samples
+        self.seed = seed if seed is not None else 2026
+
+    def __iter__(self):
+        info = get_worker_info()
+        worker_seed = self.seed if info is None else (self.seed + info.id)
+        rng = random.Random(worker_seed)
+        yielded = 0
+        for row in iter(self.base_ds):
+            if self.max_samples is not None and yielded >= self.max_samples:
+                break
+            if self.subset_ratio is not None and rng.random() > self.subset_ratio:
+                continue
+            yielded += 1
+            yield row
+
+    def __len__(self) -> int:  # pragma: no cover - best effort estimate
+        base_len = len(self.base_ds) if hasattr(self.base_ds, "__len__") else 0
+        if self.max_samples is not None:
+            base_len = min(base_len, self.max_samples)
+        if self.subset_ratio is not None and base_len:
+            return int(base_len * self.subset_ratio)
+        return base_len
+
+
 def make_dataloader(
     split: str,
     batch_size: int,
@@ -238,6 +282,10 @@ def make_dataloader(
     seed: int | None = None,
     feature_meta: Dict[str, Any] | None = None,
     debug: bool = False,
+    neg_keep_prob_train: float = 1.0,
+    subset_ratio: float | None = None,
+    subset_max_samples: int | None = None,
+    subset_seed: int | None = None,
 ) -> DataLoader:
     """
     Build a DataLoader that yields (labels, features, meta) tuples
@@ -256,7 +304,18 @@ def make_dataloader(
     if shuffle:
         raise ValueError("shuffle=True is not supported with IterableDataset; shuffle offline instead.")
 
-    ds = ProcessedIterDataset(data_dir, metadata_path=metadata_path)
+    ds: IterableDataset = ProcessedIterDataset(
+        data_dir,
+        metadata_path=metadata_path,
+        neg_keep_prob=neg_keep_prob_train if split == "train" else 1.0,
+    )
+    if split == "valid" and (subset_ratio is not None or subset_max_samples is not None):
+        ds = _SubsetIterDataset(
+            ds,
+            subset_ratio=subset_ratio,
+            max_samples=subset_max_samples,
+            seed=subset_seed if subset_seed is not None else seed,
+        )
 
     base_seed = seed if seed is not None else torch.initial_seed()
     worker_init = partial(_worker_init_with_seed, base_seed=base_seed) if seed is not None else None

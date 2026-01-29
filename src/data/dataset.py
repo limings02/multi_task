@@ -9,6 +9,7 @@ Key behaviours:
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Dict, Iterator, List, Tuple
 
@@ -38,7 +39,12 @@ class ProcessedIterDataset(IterableDataset):
     disjoint files and no examples are duplicated.
     """
 
-    def __init__(self, data_dir: str | Path, metadata_path: str | Path | None = None):
+    def __init__(
+        self,
+        data_dir: str | Path,
+        metadata_path: str | Path | None = None,
+        neg_keep_prob: float = 1.0,
+    ):
         self.data_dir = Path(data_dir)
         self.dataset = ds.dataset(self.data_dir, format="parquet")
         self.fragments = list(self.dataset.get_fragments())
@@ -50,18 +56,37 @@ class ProcessedIterDataset(IterableDataset):
             self._count = int(rows_dict[split_name])
         else:
             self._count = self.dataset.count_rows()  # fallback
+        self.split_name = split_name
+        # Only meaningful for train split; for others we keep all samples.
+        self.neg_keep_prob = float(neg_keep_prob)
+        if self.neg_keep_prob < 0.0 or self.neg_keep_prob > 1.0:
+            raise ValueError("neg_keep_prob must be in [0,1]")
 
     def __iter__(self) -> Iterator[Dict]:
         info = get_worker_info()
         fragments = self.fragments
         if info is not None and info.num_workers > 1:
             fragments = fragments[info.id :: info.num_workers]
+        rng = random.Random()
+        # Derive a worker-specific seed to keep stochastic filtering stable per worker.
+        if info is not None:
+            rng.seed(info.seed ^ 0xABCDEF)
         for frag in fragments:
             for batch in frag.to_batches():
                 tbl = batch.to_pydict()
                 rows = len(next(iter(tbl.values())))
                 for i in range(rows):
-                    yield {k: v[i] for k, v in tbl.items()}
+                    row = {k: v[i] for k, v in tbl.items()}
+                    if self.split_name == "train" and self.neg_keep_prob < 1.0:
+                        # Down-sample only when y_ctr is negative.
+                        y_ctr = row.get("y_ctr", None)
+                        try:
+                            is_negative = (y_ctr is not None) and (float(y_ctr) <= 0.0)
+                        except Exception:
+                            is_negative = False
+                        if is_negative and rng.random() > self.neg_keep_prob:
+                            continue
+                    yield row
 
     def __len__(self) -> int:
         return self._count

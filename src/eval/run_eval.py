@@ -136,6 +136,9 @@ def run_eval(
     y_ctcvr_list = [] if use_ctr and use_cvr else None
     ctr_logit_list = [] if use_ctr else None
     cvr_logit_list = [] if use_cvr else None
+    ctr_wide_logit_list = [] if use_ctr else None
+    ctr_parts_list = [] if use_ctr else None
+    logit_parts_decomposable = None
 
     with torch.no_grad():
         for step, (labels, features, meta) in enumerate(loader):
@@ -152,6 +155,24 @@ def run_eval(
                     ctr_logit = ctr_logit.view(-1)
                 y_ctr_list.append(labels_dev["y_ctr"].cpu().numpy())
                 ctr_logit_list.append(ctr_logit.cpu().numpy())
+                if "ctr_logit_parts" in outputs:
+                    parts = outputs["ctr_logit_parts"]
+                    ctr_parts_list.append(
+                        {
+                            "wide": parts.get("wide"),
+                            "fm": parts.get("fm"),
+                            "deep": parts.get("deep"),
+                            "total": parts.get("total"),
+                        }
+                    )
+                if "logit_parts_decomposable" in outputs:
+                    logit_parts_decomposable = bool(outputs["logit_parts_decomposable"])
+                if ctr_wide_logit_list is not None and "ctr_logit_parts" in outputs:
+                    wide_comp = outputs["ctr_logit_parts"].get("wide")
+                    if wide_comp is not None:
+                        if wide_comp.dim() > 1:
+                            wide_comp = wide_comp.view(-1)
+                        ctr_wide_logit_list.append(wide_comp.cpu().numpy())
 
             if use_cvr:
                 cvr_logit = outputs["cvr"]
@@ -169,10 +190,13 @@ def run_eval(
     y_ctcvr = np.concatenate(y_ctcvr_list) if y_ctcvr_list else None
     ctr_logit = np.concatenate(ctr_logit_list) if use_ctr and ctr_logit_list else np.array([])
     cvr_logit = np.concatenate(cvr_logit_list) if use_cvr and cvr_logit_list else np.array([])
+    ctr_wide_logit = np.concatenate(ctr_wide_logit_list) if ctr_wide_logit_list else np.array([])
 
     empty_metrics = {"logloss": None, "auc": None, "pos_rate": None, "pred_mean": None, "n": 0}
     ctr_metrics = compute_binary_metrics(y_ctr, ctr_logit) if use_ctr else empty_metrics
     cvr_metrics_masked = compute_binary_metrics(y_cvr, cvr_logit, mask=click_mask > 0.5) if use_cvr else empty_metrics
+
+    ctr_wide_metrics = compute_binary_metrics(y_ctr, ctr_wide_logit) if (use_ctr and ctr_wide_logit.size) else empty_metrics
 
     ece_ctr = compute_ece_from_logits(y_ctr, ctr_logit) if use_ctr else {"ece": None, "bins": []}
     ece_cvr_masked = (
@@ -208,6 +232,55 @@ def run_eval(
             enabled_heads=enabled_heads_list,
         )
 
+    def _stack_parts(parts_list, key):
+        if not parts_list:
+            return None
+        vals = []
+        for p in parts_list:
+            v = p.get(key)
+            if v is None:
+                continue
+            if torch.is_tensor(v):
+                v = v.view(-1).cpu().numpy()
+            vals.append(v)
+        if not vals:
+            return None
+        return np.concatenate(vals)
+
+    def _part_stats(component: Optional[np.ndarray], total: Optional[np.ndarray]) -> Dict[str, Optional[float]]:
+        if component is None or component.size == 0:
+            return {"mean": None, "std": None, "min": None, "max": None, "var_ratio": None, "corr_with_total": None}
+        stats = {
+            "mean": float(component.mean()),
+            "std": float(component.std()),
+            "min": float(component.min()),
+            "max": float(component.max()),
+        }
+        var_total = float(total.var()) if total is not None and total.size else 0.0
+        stats["var_ratio"] = float(component.var() / var_total) if var_total > 0 else None
+        if total is not None and total.size == component.size and component.size > 1:
+            try:
+                corr = float(np.corrcoef(component, total)[0, 1])
+            except Exception:
+                corr = None
+        else:
+            corr = None
+        stats["corr_with_total"] = corr
+        return stats
+
+    ctr_parts_stats = None
+    if ctr_parts_list:
+        wide_comp = _stack_parts(ctr_parts_list, "wide")
+        fm_comp = _stack_parts(ctr_parts_list, "fm")
+        deep_comp = _stack_parts(ctr_parts_list, "deep")
+        total_comp = _stack_parts(ctr_parts_list, "total")
+        ctr_parts_stats = {
+            "wide": _part_stats(wide_comp, total_comp),
+            "fm": _part_stats(fm_comp, total_comp),
+            "deep": _part_stats(deep_comp, total_comp),
+            "total": _part_stats(total_comp, total_comp),
+        }
+
     resolved_run_dir.mkdir(parents=True, exist_ok=True)
     eval_path = resolved_run_dir / "eval.json"
 
@@ -221,6 +294,8 @@ def run_eval(
         "cvr_auc_masked": cvr_metrics_masked["auc"] if use_cvr else None,
         "ctr_logloss": ctr_metrics["logloss"] if use_ctr else None,
         "cvr_logloss_masked": cvr_metrics_masked["logloss"] if use_cvr else None,
+        "ctr_wide_only_auc": ctr_wide_metrics["auc"] if use_ctr else None,
+        "ctr_wide_only_logloss": ctr_wide_metrics["logloss"] if use_ctr else None,
         "ece_ctr": ece_ctr["ece"] if use_ctr else None,
         "ece_cvr_masked": ece_cvr_masked["ece"] if use_cvr else None,
         "ctr": ctr_metrics,
@@ -231,6 +306,8 @@ def run_eval(
         "preds": preds_summary,
         "n": int(y_ctr.shape[0]) if use_ctr else 0,
         "n_masked": int(int((click_mask > 0.5).sum())) if use_cvr and click_mask.size else 0,
+        "ctr_logit_parts_stats": ctr_parts_stats,
+        "logit_parts_decomposable": logit_parts_decomposable,
     }
 
     with eval_path.open("w", encoding="utf-8") as f:

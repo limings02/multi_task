@@ -48,12 +48,21 @@ class MultiTaskBCELoss:
         loss_cvr_raw_val: float | None = None
         loss_ctr_scaled_val: float | None = None
         loss_cvr_scaled_val: float | None = None
+        pos_weight_ctr_val: float | None = None
+        pos_weight_cvr_val: float | None = None
 
         if "ctr" in self.enabled_heads:
             ctr_logit = outputs["ctr"]
             assert y_ctr is not None, "y_ctr missing from labels"
             assert ctr_logit.shape == y_ctr.shape, "ctr logit/label shape mismatch"
-            loss_ctr = F.binary_cross_entropy_with_logits(ctr_logit, y_ctr, reduction="mean")
+            # 动态计算 CTR 正例权重：neg/pos
+            pos_count = torch.clamp(y_ctr.sum(), min=self.eps)
+            neg_count = torch.clamp((1.0 - y_ctr).sum(), min=self.eps)
+            pos_weight_ctr = neg_count / pos_count
+            pos_weight_ctr_val = float(pos_weight_ctr.item())
+            loss_ctr = F.binary_cross_entropy_with_logits(
+                ctr_logit, y_ctr, reduction="mean", pos_weight=pos_weight_ctr
+            )
             loss_ctr_raw_val = float(loss_ctr.item())
             loss_ctr_scaled_val = float(loss_ctr_raw_val * self.w_ctr)
 
@@ -63,11 +72,18 @@ class MultiTaskBCELoss:
             assert click_mask is not None, "click_mask missing from labels"
             assert cvr_logit.shape == y_cvr.shape, "cvr logit/label shape mismatch"
 
-            loss_cvr_vec = F.binary_cross_entropy_with_logits(cvr_logit, y_cvr, reduction="none")
             mask = click_mask
             mask_sum = mask.sum()
             mask_sum_val = float(mask_sum.item())
             if mask_sum_val > 0:
+                # 仅在有点击的子集上计算 pos_weight，防止未曝光样本干扰
+                pos_count_cvr = torch.clamp((y_cvr * mask).sum(), min=self.eps)
+                neg_count_cvr = torch.clamp(((1.0 - y_cvr) * mask).sum(), min=self.eps)
+                pos_weight_cvr = neg_count_cvr / pos_count_cvr
+                pos_weight_cvr_val = float(pos_weight_cvr.item())
+                loss_cvr_vec = F.binary_cross_entropy_with_logits(
+                    cvr_logit, y_cvr, reduction="none", pos_weight=pos_weight_cvr
+                )
                 loss_cvr = (loss_cvr_vec * mask).sum() / (mask_sum + self.eps)
                 loss_cvr_raw_val = float(loss_cvr.item())
                 loss_cvr_scaled_val = float(loss_cvr_raw_val * self.w_cvr)
@@ -103,6 +119,8 @@ class MultiTaskBCELoss:
             "loss_ctr_scaled": loss_ctr_scaled_val,
             "loss_cvr_scaled": loss_cvr_scaled_val,
             "loss_ratio_scaled": loss_ratio_scaled,
+            "pos_weight_ctr": pos_weight_ctr_val,
+            "pos_weight_cvr": pos_weight_cvr_val,
         }
         return loss_total, loss_dict
 

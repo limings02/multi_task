@@ -57,6 +57,7 @@ def main() -> None:
         seed=data_cfg.get("seed"),
         feature_meta=feature_meta,
         debug=bool(_get_cfg(data_cfg, "debug", False)),
+        neg_keep_prob_train=float(_get_cfg(data_cfg, "neg_keep_prob_train", 1.0)),
     )
 
     model = DeepFMBackbone(

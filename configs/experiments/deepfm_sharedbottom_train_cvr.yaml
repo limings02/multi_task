@@ -1,24 +1,32 @@
 experiment:
-  name: "deepfm_sharedbottom"
+  name: "deepfm_sharedbottom_cvr"
 
 data:
   processed_dir: "data/processed"
   metadata_path: "data/processed/metadata.json"
   batch_size: 256
-  num_workers: 4
-  pin_memory: true
+  num_workers: 0
+  pin_memory: false
   persistent_workers: false
   drop_last: false
   debug: false
   seed: 20260127
+  neg_keep_prob_train: 0.4  # keep 50% 负样本，正样本全保留
 
 embedding:
   default_embedding_dim: 8
   embedding_dim_overrides: {}
-  mode: "sum"
+  mode: "sum" # 其实是mean，只是因为iterdataset不允许，后面转为手动实现了
 
 model:
-  name: "deepfm_shared_bottom"
+  name: "deepfm_shared_bottom_cvr"
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      ctr: { use_wide: true, use_fm: true }
+      cvr: { use_wide: true, use_fm: true }
+      ctcvr: { use_wide: true, use_fm: true }
   enabled_heads: ["cvr"]
   tasks: ["cvr"]
   heads:
@@ -39,7 +47,7 @@ model:
 
 optim:
   lr: 0.001
-  weight_decay: 0.0
+  weight_decay: 1e-6
   betas: [0.9, 0.999]
   eps: 1.0e-8
 
@@ -51,15 +59,16 @@ loss:
 runtime:
   device: "cuda"
   epochs: 1
-  log_every: 1000
+  log_every: 4000
   amp: true
-  grad_diag_enabled: false
-  max_train_steps: 5000  # smoke
-  max_valid_steps: 300  # smoke
-  grad_clip_norm: null
+  grad_diag_enabled: true
+  max_train_steps: 20000 # smoke
+  max_valid_steps: 4000  # smoke
+  grad_clip_norm: 1.0
   seed: 20260127
   resume_path: null
   auto_eval: true
   auto_eval_split: "valid"
   auto_eval_save_preds: true
   auto_eval_ckpt: "best"  # "best" or "last"
+  save_last: false

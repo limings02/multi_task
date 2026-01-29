@@ -172,3 +172,4 @@ python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_tr
 - 新增评估模块：src/eval/metrics.py, src/train/infer.py, src/eval/calibration.py, src/eval/funnel.py 
 - CVR 指标按 click_mask 过滤（仅在点击样本上计算） 
 - 若未安装 sklearn，AUC 字段为 null，程序不会报错 )
+
