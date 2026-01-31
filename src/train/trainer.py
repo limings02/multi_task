@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
-from torch import optim, amp as torch_amp
+from torch import amp as torch_amp
 import yaml
 
 from src.core.checkpoint import load_checkpoint, save_checkpoint
@@ -19,7 +19,9 @@ from src.loss.bce import MultiTaskBCELoss
 from src.models.build import build_model
 from src.eval.run_eval import run_eval
 from src.train.loops import train_one_epoch, validate
+from src.train.optim import build_optimizer_bundle
 from src.utils.feature_meta import build_model_feature_meta
+from src.utils.metrics_schema import apply_esmm_schema
 
 
 def _setup_logger(log_path: Path) -> logging.Logger:
@@ -71,12 +73,17 @@ class Trainer:
         self.cfg = cfg
         self.config_path = Path(config_path).resolve() if config_path else None
 
+        self.use_esmm = bool(cfg.get("use_esmm", False))
+        sampling_cfg = cfg.get("sampling", {}) or {}
+        self.negative_sampling = str(sampling_cfg.get("negative_sampling", "keep_prob")).lower()
+
         tags = get_exp_tags(cfg)
         self.enabled_heads = tags["enabled_heads"]
         self.model_name = tags["model_name"]
         self.exp_name = tags["exp_name"]
         self.seed_value = tags["seed"]
         self.metrics_meta = {**tags, "config_path": str(self.config_path) if self.config_path else None}
+        self.metrics_meta["mode"] = "esmm" if self.use_esmm else "non-esmm"
         exp_name = cfg.get("experiment", {}).get("name", "exp")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_dir = Path("runs") / f"{exp_name}_{ts}"
@@ -112,6 +119,41 @@ class Trainer:
         embedding_cfg = cfg.get("embedding", {})
         self.feature_meta = build_model_feature_meta(metadata_path, embedding_cfg)
 
+        loss_cfg = cfg.get("loss", {})
+        static_pos_weight_cfg = loss_cfg.get("static_pos_weight", {}) or {}
+        pos_weight_clip_cfg = loss_cfg.get("pos_weight_clip", {}) or {}
+
+        def _validate_esmm_requirements() -> None:
+            if not self.use_esmm:
+                return
+            if bool(loss_cfg.get("pos_weight_dynamic", True)):
+                raise ValueError("use_esmm=true requires loss.pos_weight_dynamic to be false (static pos_weight only).")
+            if self.negative_sampling not in {"none", "off", "disable", "disabled"}:
+                raise ValueError(
+                    f"use_esmm=true requires sampling.negative_sampling='none'; got '{self.negative_sampling}'."
+                )
+            if "ctr" not in static_pos_weight_cfg or "ctcvr" not in static_pos_weight_cfg:
+                raise ValueError("use_esmm=true requires loss.static_pos_weight.ctr and loss.static_pos_weight.ctcvr to be set.")
+
+        _validate_esmm_requirements()
+
+        # Resolve negative sampling keep prob (enforced to 1.0 for ESMM)
+        neg_keep_prob_cfg = float(cfg.get("data", {}).get("neg_keep_prob_train", 1.0))
+        if self.negative_sampling in {"none", "off", "disable", "disabled"} or self.use_esmm:
+            self.neg_keep_prob_train = 1.0
+        else:
+            self.neg_keep_prob_train = neg_keep_prob_cfg
+
+        self.logger.info(
+            "mode=%s pos_weight_dynamic=%s pos_weight_ctr=%s pos_weight_ctcvr=%s neg_sampling=%s neg_keep_prob_train=%.3f",
+            "esmm" if self.use_esmm else "non-esmm",
+            bool(loss_cfg.get("pos_weight_dynamic", True)),
+            static_pos_weight_cfg.get("ctr"),
+            static_pos_weight_cfg.get("ctcvr"),
+            self.negative_sampling,
+            self.neg_keep_prob_train,
+        )
+
         self.train_loader = make_dataloader(
             split="train",
             batch_size=int(cfg["data"]["batch_size"]),
@@ -123,7 +165,7 @@ class Trainer:
             seed=cfg["data"].get("seed"),
             feature_meta=self.feature_meta,
             debug=bool(cfg["data"].get("debug", False) or self.debug_dataloader_assert),
-            neg_keep_prob_train=float(cfg["data"].get("neg_keep_prob_train", 1.0)),
+            neg_keep_prob_train=self.neg_keep_prob_train,
         )
         self.valid_loader = make_dataloader(
             split="valid",
@@ -147,20 +189,30 @@ class Trainer:
             self.model.debug_logit = self.debug_logit_every > 0
 
         opt_cfg = cfg.get("optim", {})
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=float(opt_cfg.get("lr", 1e-3)),
-            weight_decay=float(opt_cfg.get("weight_decay", 0.0)),
-            betas=tuple(opt_cfg.get("betas", (0.9, 0.999))),
-            eps=float(opt_cfg.get("eps", 1e-8)),
-        )
+        self.optim_bundle = build_optimizer_bundle(cfg, self.model, scaler=self.scaler)
 
-        loss_cfg = cfg.get("loss", {})
         self.loss_fn = MultiTaskBCELoss(
             w_ctr=float(loss_cfg.get("w_ctr", 1.0)),
             w_cvr=float(loss_cfg.get("w_cvr", 1.0)),
             eps=float(loss_cfg.get("eps", 1e-6)),
+            use_esmm=self.use_esmm,
+            lambda_ctr=float(cfg.get("esmm", {}).get("lambda_ctr", 1.0)),
+            lambda_ctcvr=float(cfg.get("esmm", {}).get("lambda_ctcvr", 1.0)),
+            esmm_eps=float(cfg.get("esmm", {}).get("eps", 1e-8)),
             enabled_heads=self.enabled_heads,
+            pos_weight_dynamic=bool(loss_cfg.get("pos_weight_dynamic", True)),
+            static_pos_weight_ctr=(
+                float(static_pos_weight_cfg["ctr"]) if "ctr" in static_pos_weight_cfg else None
+            ),
+            static_pos_weight_ctcvr=(
+                float(static_pos_weight_cfg["ctcvr"]) if "ctcvr" in static_pos_weight_cfg else None
+            ),
+            pos_weight_clip_ctr=(
+                float(pos_weight_clip_cfg["ctr"]) if "ctr" in pos_weight_clip_cfg else None
+            ),
+            pos_weight_clip_ctcvr=(
+                float(pos_weight_clip_cfg["ctcvr"]) if "ctcvr" in pos_weight_clip_cfg else None
+            ),
         )
 
         self.best_metric: float = float("-inf")  # tracks best full AUC
@@ -168,7 +220,7 @@ class Trainer:
 
         resume_path = cfg.get("runtime", {}).get("resume_path")
         if resume_path:
-            info = load_checkpoint(resume_path, self.model, self.optimizer, map_location=self.device, strict=False)
+            info = load_checkpoint(resume_path, self.model, self.optim_bundle, map_location=self.device, strict=False)
             self.best_metric = info.get("best_metric", self.best_metric)
             self.global_step = info.get("step", 0) or 0
             self.logger.info(f"Resumed from {resume_path}, step={self.global_step}, best_metric={self.best_metric}")
@@ -178,7 +230,7 @@ class Trainer:
             **self.metrics_meta,
             "amp_enabled": self.amp_enabled,
             "amp_dtype": "fp16" if self.amp_enabled else "none",
-            **metrics,
+            **apply_esmm_schema(metrics, self.use_esmm),
         }
         if self.amp_enabled and hasattr(self, "scaler") and self.scaler is not None:
             payload["scaler_scale"] = float(self.scaler.get_scale())
@@ -222,7 +274,7 @@ class Trainer:
                     save_checkpoint(
                         self.run_dir / "ckpt_best.pt",
                         self.model,
-                        self.optimizer,
+                        self.optim_bundle,
                         cfg=self.cfg,
                         step=g_step,
                         best_metric=self.best_metric,
@@ -233,7 +285,7 @@ class Trainer:
             train_metrics = train_one_epoch(
                 self.model,
                 self.train_loader,
-                self.optimizer,
+                self.optim_bundle,
                 self.loss_fn,
                 self.device,
                 self.logger,
@@ -277,7 +329,7 @@ class Trainer:
                 save_checkpoint(
                     self.run_dir / "ckpt_last.pt",
                     self.model,
-                    self.optimizer,
+                    self.optim_bundle,
                     cfg=self.cfg,
                     step=self.global_step,
                     best_metric=self.best_metric,
@@ -290,7 +342,7 @@ class Trainer:
                     save_checkpoint(
                         self.run_dir / "ckpt_best.pt",
                         self.model,
-                        self.optimizer,
+                        self.optim_bundle,
                         cfg=self.cfg,
                         step=self.global_step,
                         best_metric=self.best_metric,

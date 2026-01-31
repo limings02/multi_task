@@ -168,8 +168,17 @@ train_loader = build_dataloader(
 python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train.yaml
 python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train_ctr.yaml
 python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train_cvr.yaml
-```## Phase 5 Eval (AUC/LogLoss/ECE/Funnel
+```
+## Phase 5 Eval (AUC/LogLoss/ECE/Funnel
 - 新增评估模块：src/eval/metrics.py, src/train/infer.py, src/eval/calibration.py, src/eval/funnel.py 
 - CVR 指标按 click_mask 过滤（仅在点击样本上计算） 
-- 若未安装 sklearn，AUC 字段为 null，程序不会报错 )
+- 若未安装 sklearn，AUC 字段为 null，程序不会报错 )```
 
+## MMoE
+python -m src.cli.main train --config configs/experiments/mtl_mmoe.yaml  
+
+## 更新速览
+- 新增 MMoE 多任务结构，可通过 `model.mtl=mmoe` 启用（示例：`configs/experiments/mtl_mmoe.yaml` / `configs/model/mtl_mmoe_dual_sparse.yaml`）。
+- 优化器框架升级为 OptimizerBundle，支持 `optim.type = single | dual_sparse_dense`，可选稀疏优化器（SparseAdam）；旧配置与旧 ckpt 仍兼容。
+- 支持稀疏梯度：在 `embedding.sparse_grad=true` 时 EmbeddingBag 使用稀疏权重并由 SparseAdam 更新；未开启时保持原有 dense 行为。
+- 重要护栏：`optim.sparse.enabled=true` 且未找到稀疏参数会报错，除非 `allow_fallback_if_empty=true` 才降级为 dense；日志会输出稀疏/稠密参数统计与加载的优化器类型。

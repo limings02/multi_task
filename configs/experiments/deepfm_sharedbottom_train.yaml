@@ -25,7 +25,7 @@ model:
     return_logit_parts: true
     per_head_add:
       ctr: { use_wide: true, use_fm: true }
-      cvr: { use_wide: false, use_fm: false }
+      cvr: { use_wide: true, use_fm: true }
       ctcvr: { use_wide: true, use_fm: true }
   enabled_heads: ["ctr","cvr"]
   tasks: ["ctr", "cvr"]
@@ -66,13 +66,14 @@ runtime:
   log_every: 4000
   amp: true
   grad_diag_enabled: true
-  max_train_steps: 50 # smoke
-  max_valid_steps: 50  # smoke
+  max_train_steps: 20000 # smoke
+  max_valid_steps: 4000  # smoke
   grad_clip_norm: 1.0
   seed: 20260127
   resume_path: null
-  auto_eval: false
+  auto_eval: true
   auto_eval_split: "valid"
-  auto_eval_save_preds: false
+  auto_eval_save_preds: true
   auto_eval_ckpt: "best"  # "best" or "last"
   save_last: false
+

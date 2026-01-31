@@ -110,15 +110,55 @@ def collate_fn_embeddingbag(
         if any_use_value:
             break
 
-    # 2) labels/meta
+    # 2) labels/meta with ESMM-friendly guards
+    log = logging.getLogger(__name__)
+    y_ctr_list: List[float] = []
+    y_cvr_list: List[float] = []
+    y_ctcvr_list: List[float] = []
+    click_mask_list: List[float] = []
+    row_id_list: List[int] = []
+    entity_id_list: List[Any] = []
+    funnel_bad = 0
+
+    for row in batch:
+        y_ctr = float(row.get("y_ctr", 0.0))
+        raw_y_cvr = row.get("y_cvr", 0.0)
+        try:
+            y_cvr = float(raw_y_cvr)
+        except Exception:
+            y_cvr = 0.0
+
+        if y_ctr <= 0.0 and y_cvr > 0.0:
+            funnel_bad += 1
+            y_cvr = 0.0  # enforce funnel consistency: no conversion without click
+        if y_ctr <= 0.0:
+            y_cvr = 0.0
+
+        click_mask = row.get("click_mask")
+        if click_mask is None:
+            click_mask = 1.0 if y_ctr > 0.0 else 0.0
+        click_mask = float(click_mask)
+
+        y_ctcvr = 1.0 if (y_ctr > 0.5 and y_cvr > 0.5) else 0.0
+
+        y_ctr_list.append(y_ctr)
+        y_cvr_list.append(y_cvr)
+        y_ctcvr_list.append(y_ctcvr)
+        click_mask_list.append(click_mask)
+        row_id_list.append(int(row.get("row_id", len(row_id_list))))
+        entity_id_list.append(row.get("entity_id"))
+
+    if funnel_bad:
+        log.warning("funnel_bad detected: %d samples had y_cvr=1 while y_ctr=0; coerced y_cvr->0.", funnel_bad)
+
     labels = {
-        "y_ctr": torch.tensor([float(b["y_ctr"]) for b in batch], dtype=torch.float32),
-        "y_cvr": torch.tensor([float(b["y_cvr"]) for b in batch], dtype=torch.float32),
-        "y_ctcvr": torch.tensor([float(b["y_ctcvr"]) for b in batch], dtype=torch.float32),
-        "click_mask": torch.tensor([float(b["click_mask"]) for b in batch], dtype=torch.float32),
-        "row_id": torch.tensor([int(b["row_id"]) for b in batch], dtype=torch.int64),
+        "y_ctr": torch.tensor(y_ctr_list, dtype=torch.float32),
+        "y_cvr": torch.tensor(y_cvr_list, dtype=torch.float32),
+        "y_ctcvr": torch.tensor(y_ctcvr_list, dtype=torch.float32),
+        "click_mask": torch.tensor(click_mask_list, dtype=torch.float32),
+        "row_id": torch.tensor(row_id_list, dtype=torch.int64),
     }
-    meta_out = {"entity_id": [b["entity_id"] for b in batch]}
+    meta_out = {"entity_id": entity_id_list}
 
     # 3) per-field accumulation
     indices_map: Dict[str, List[int]] = {base: [] for base in bases}

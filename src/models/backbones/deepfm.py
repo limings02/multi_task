@@ -27,10 +27,11 @@ class DeepFMBackbone(nn.Module):
         out_dim: int = 128,
         use_legacy_pseudo_deepfm: bool = True,
         return_logit_parts: bool = False,
+        sparse_grad: bool = False,
     ):
         super().__init__()
         self.feature_meta = feature_meta
-        self.feat_emb = FeatureEmbedding(feature_meta)
+        self.feat_emb = FeatureEmbedding(feature_meta, sparse_grad=sparse_grad)
         self.field_names_sorted: List[str] = sorted(feature_meta.keys())
         # Debug flags (set externally, e.g., in Trainer) – no effect on forward outputs.
         self.debug_linear: bool = False

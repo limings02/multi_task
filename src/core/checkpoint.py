@@ -7,12 +7,15 @@ from typing import Any, Dict, Optional
 import torch
 from torch import nn
 from torch.optim import Optimizer
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def save_checkpoint(
     path: str | Path,
     model: nn.Module,
-    optimizer: Optimizer | None,
+    optimizer: Any | None,
     cfg: Dict[str, Any],
     step: int,
     best_metric: float | None = None,
@@ -33,7 +36,20 @@ def save_checkpoint(
         "torch_version": torch.__version__,
     }
     if optimizer is not None:
-        state["optimizer"] = optimizer.state_dict()
+        # OptimizerBundle path (preferred)
+        if hasattr(optimizer, "state_dict") and hasattr(optimizer, "has_sparse"):
+            optim_sd = optimizer.state_dict()
+            state["optimizers"] = {
+                "dense": optim_sd.get("dense"),
+                "sparse": optim_sd.get("sparse"),
+            }
+            if hasattr(optimizer, "scaler_state_dict"):
+                scaler_sd = optimizer.scaler_state_dict()
+                if scaler_sd is not None:
+                    state["scaler"] = scaler_sd
+        elif hasattr(optimizer, "state_dict"):
+            # Legacy single-optimizer format
+            state["optimizer"] = optimizer.state_dict()
 
     torch.save(state, tmp)
     os.replace(tmp, target)  # atomic on Windows/POSIX
@@ -42,7 +58,7 @@ def save_checkpoint(
 def load_checkpoint(
     path: str | Path,
     model: nn.Module,
-    optimizer: Optimizer | None = None,
+    optimizer: Any | None = None,
     map_location: str | torch.device = "cpu",
     strict: bool = True,
 ) -> Dict[str, Any]:
@@ -67,8 +83,21 @@ def load_checkpoint(
     elif strict and (missing or unexpected):
         raise RuntimeError(f"State dict mismatch. Missing: {missing}, Unexpected: {unexpected}")
 
-    if optimizer is not None and "optimizer" in chkpt:
-        optimizer.load_state_dict(chkpt["optimizer"])
+    if optimizer is not None:
+        if "optimizers" in chkpt and hasattr(optimizer, "load_state_dict"):
+            optimizer.load_state_dict(chkpt["optimizers"])
+            logger.info("load_checkpoint: loaded optimizer bundle (dense%s)", " + sparse" if chkpt["optimizers"].get("sparse") is not None else "")
+        elif "optimizer" in chkpt and hasattr(optimizer, "load_state_dict"):
+            optimizer.load_state_dict(chkpt["optimizer"])
+            logger.info("load_checkpoint: loaded legacy optimizer into dense slot")
+        else:
+            logger.warning("load_checkpoint: no optimizer state found in checkpoint.")
+
+        if "scaler" in chkpt and hasattr(optimizer, "load_scaler_state"):
+            optimizer.load_scaler_state(chkpt.get("scaler"))
+            logger.info("load_checkpoint: loaded scaler state")
+        elif hasattr(optimizer, "load_scaler_state"):
+            logger.info("load_checkpoint: scaler state not present or amp disabled, skipping.")
 
     return {
         "step": chkpt.get("step"),

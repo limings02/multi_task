@@ -53,13 +53,15 @@ class EmbeddingBagEncoder(nn.Module):
     Thin wrapper around nn.EmbeddingBag with include_last_offset=False.
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, mode: str = "sum"):
+    def __init__(self, num_embeddings: int, embedding_dim: int, mode: str = "sum", sparse: bool = False):
         super().__init__()
+        self.sparse = bool(sparse)
         self.embedding = nn.EmbeddingBag(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
             mode=mode,
             include_last_offset=False,
+            sparse=self.sparse,
         )
 
     def forward(
@@ -80,9 +82,10 @@ class FeatureEmbedding(nn.Module):
     Encode per-field indices/offsets/weights into embeddings.
     """
 
-    def __init__(self, feature_meta: Dict[str, Dict[str, Any]]):
+    def __init__(self, feature_meta: Dict[str, Dict[str, Any]], sparse_grad: bool = False):
         super().__init__()
         self.feature_meta = feature_meta
+        self.sparse_grad = bool(sparse_grad)
         self.embedders = nn.ModuleDict()
         self.embedding_dims: Dict[str, int] = {}
 
@@ -94,6 +97,7 @@ class FeatureEmbedding(nn.Module):
                 num_embeddings=num_embeddings,
                 embedding_dim=emb_dim,
                 mode=mode,
+                sparse=self.sparse_grad,
             )
             self.embedding_dims[base] = emb_dim
 

@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from src.loss.bce import MultiTaskBCELoss
 
@@ -24,3 +25,28 @@ def test_bce_loss_masking_and_backward():
     assert log_zero["loss_cvr"] == 0.0  # when no clicks, cvr loss should be zero not NaN
 
 
+def test_bce_loss_static_pos_weight_uses_config_and_clips():
+    outputs = {"ctr": torch.tensor([0.0, 0.0], requires_grad=True)}
+    labels = {
+        "y_ctr": torch.tensor([1.0, 0.0]),
+        "y_cvr": torch.tensor([0.0, 0.0]),
+        "click_mask": torch.tensor([0.0, 0.0]),
+    }
+
+    loss_static = MultiTaskBCELoss(
+        pos_weight_dynamic=False,
+        static_pos_weight_ctr=24.7,
+        enabled_heads=["ctr"],
+    )
+    _, log_static = loss_static.compute(outputs, labels)
+    assert log_static["pos_weight_ctr"] == pytest.approx(24.7)
+    assert log_static["pos_weight_mode"] == "static"
+
+    loss_clipped = MultiTaskBCELoss(
+        pos_weight_dynamic=False,
+        static_pos_weight_ctr=1000.0,
+        pos_weight_clip_ctr=500.0,
+        enabled_heads=["ctr"],
+    )
+    _, log_clipped = loss_clipped.compute(outputs, labels)
+    assert log_clipped["pos_weight_ctr"] == pytest.approx(500.0)

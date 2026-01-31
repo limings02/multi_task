@@ -22,6 +22,7 @@ from src.eval.metrics import compute_binary_metrics, sigmoid
 from src.models.build import build_model
 from src.train.infer import infer_to_parquet
 from src.utils.feature_meta import build_model_feature_meta
+from src.utils.metrics_schema import apply_esmm_schema
 
 LOG = get_logger(__name__)
 
@@ -116,6 +117,8 @@ def run_eval(
     enabled_heads_list = metadata["enabled_heads"]
     enabled_heads = set(enabled_heads_list)
     resolved_run_dir = _resolve_run_dir(run_dir, ckpt_path, cfg)
+    use_esmm = bool(cfg.get("use_esmm", False))
+    esmm_eps = float(cfg.get("esmm", {}).get("eps", 1e-8))
 
     # Build feature meta + loader + model
     feature_meta = build_model_feature_meta(Path(cfg["data"]["metadata_path"]), cfg.get("embedding", {}))
@@ -126,6 +129,23 @@ def run_eval(
         load_checkpoint(ckpt_path, model, optimizer=None, map_location=device, strict=False)
         log.info("Loaded checkpoint from %s", ckpt_path)
 
+    # Switch to eval mode to disable dropout/BN training behavior
+    model.eval()
+
+    # Negative sampling correction: if training used neg_keep_prob < 1, we need to
+    # shift logits to correct for the sampling bias in probability estimates.
+    # Formula: logit_corrected = logit_raw - log((1-r)/r) where r = neg_keep_prob
+    # This does NOT affect AUC (rank-preserving), but fixes logloss/ECE/pred_mean.
+    sampling_mode = str(cfg.get("sampling", {}).get("negative_sampling", "keep_prob")).lower()
+    neg_keep_prob = float(cfg.get("data", {}).get("neg_keep_prob_train", 1.0))
+    if use_esmm or sampling_mode in {"none", "off", "disable", "disabled"}:
+        neg_keep_prob = 1.0
+    logit_correction = 0.0
+    if neg_keep_prob < 1.0 and neg_keep_prob > 0.0:
+        # Correction term to shift from sampled distribution to original distribution
+        logit_correction = float(np.log((1.0 - neg_keep_prob) / neg_keep_prob))
+        log.info("Applying logit correction=%.4f for neg_keep_prob=%.3f", logit_correction, neg_keep_prob)
+
     # Forward pass to collect logits/labels for metrics
     use_ctr = "ctr" in enabled_heads
     use_cvr = "cvr" in enabled_heads
@@ -133,9 +153,11 @@ def run_eval(
     y_ctr_list = [] if use_ctr else None
     y_cvr_list = [] if use_cvr else None
     click_mask_list = [] if use_cvr else None
-    y_ctcvr_list = [] if use_ctr and use_cvr else None
+    y_ctcvr_list = [] if use_cvr and use_esmm else None
     ctr_logit_list = [] if use_ctr else None
     cvr_logit_list = [] if use_cvr else None
+    ctcvr_logit_list = [] if use_cvr and use_esmm else None
+    p_cvr_logit_list = [] if use_cvr and use_esmm else None
     ctr_wide_logit_list = [] if use_ctr else None
     ctr_parts_list = [] if use_ctr else None
     logit_parts_decomposable = None
@@ -178,33 +200,86 @@ def run_eval(
                 cvr_logit = outputs["cvr"]
                 if cvr_logit.dim() > 1:
                     cvr_logit = cvr_logit.view(-1)
-                y_cvr_list.append(labels_dev["y_cvr"].cpu().numpy())
-                click_mask_list.append(labels_dev["click_mask"].cpu().numpy())
-                cvr_logit_list.append(cvr_logit.cpu().numpy())
-                if y_ctcvr_list is not None and "y_ctcvr" in labels_dev:
-                    y_ctcvr_list.append(labels_dev["y_ctcvr"].cpu().numpy())
+                if use_esmm:
+                    ctcvr_logit = cvr_logit
+                    cvr_logit_list.append(ctcvr_logit.cpu().numpy())
+                    if ctcvr_logit_list is not None:
+                        ctcvr_logit_list.append(ctcvr_logit.cpu().numpy())
+                    if y_ctcvr_list is not None and "y_ctcvr" in labels_dev:
+                        y_ctcvr_list.append(labels_dev["y_ctcvr"].cpu().numpy())
+
+                    # Derived post-click CVR prob/logit
+                    ctr_logit_for_ratio = outputs["ctr"]
+                    if ctr_logit_for_ratio.dim() > 1:
+                        ctr_logit_for_ratio = ctr_logit_for_ratio.view(-1)
+                    p_ctr = sigmoid(ctr_logit_for_ratio)
+                    p_ctcvr = sigmoid(ctcvr_logit)
+                    p_cvr = p_ctcvr / (p_ctr + esmm_eps)
+                    p_cvr = torch.clamp(p_cvr, max=1.0)
+                    p_cvr_logit = torch.log(p_cvr / torch.clamp(1.0 - p_cvr, min=esmm_eps))
+                    if p_cvr_logit_list is not None:
+                        p_cvr_logit_list.append(p_cvr_logit.cpu().numpy())
+                    y_cvr_list.append(labels_dev["y_cvr"].cpu().numpy())
+                    # click mask equivalent: clicked rows (y_ctr==1)
+                    click_mask_list.append(labels_dev["y_ctr"].cpu().numpy())
+                else:
+                    y_cvr_list.append(labels_dev["y_cvr"].cpu().numpy())
+                    click_mask_list.append(labels_dev["click_mask"].cpu().numpy())
+                    cvr_logit_list.append(cvr_logit.cpu().numpy())
+                    if y_ctcvr_list is not None and "y_ctcvr" in labels_dev:
+                        y_ctcvr_list.append(labels_dev["y_ctcvr"].cpu().numpy())
 
     y_ctr = np.concatenate(y_ctr_list) if use_ctr and y_ctr_list else np.array([])
     y_cvr = np.concatenate(y_cvr_list) if use_cvr and y_cvr_list else np.array([])
     click_mask = np.concatenate(click_mask_list) if use_cvr and click_mask_list else np.array([])
     y_ctcvr = np.concatenate(y_ctcvr_list) if y_ctcvr_list else None
-    ctr_logit = np.concatenate(ctr_logit_list) if use_ctr and ctr_logit_list else np.array([])
+    ctr_logit_raw = np.concatenate(ctr_logit_list) if use_ctr and ctr_logit_list else np.array([])
     cvr_logit = np.concatenate(cvr_logit_list) if use_cvr and cvr_logit_list else np.array([])
-    ctr_wide_logit = np.concatenate(ctr_wide_logit_list) if ctr_wide_logit_list else np.array([])
+    ctcvr_logit = np.concatenate(ctcvr_logit_list) if ctcvr_logit_list else None
+    p_cvr_logit = np.concatenate(p_cvr_logit_list) if p_cvr_logit_list else None
+    ctr_wide_logit_raw = np.concatenate(ctr_wide_logit_list) if ctr_wide_logit_list else np.array([])
+
+    # Apply logit correction to CTR predictions (negative sampling affects CTR label distribution)
+    # CVR is evaluated on clicked subset only, which is not affected by CTR negative sampling
+    ctr_logit = ctr_logit_raw - logit_correction if ctr_logit_raw.size > 0 else ctr_logit_raw
+    ctr_wide_logit = ctr_wide_logit_raw - logit_correction if ctr_wide_logit_raw.size > 0 else ctr_wide_logit_raw
 
     empty_metrics = {"logloss": None, "auc": None, "pos_rate": None, "pred_mean": None, "n": 0}
     ctr_metrics = compute_binary_metrics(y_ctr, ctr_logit) if use_ctr else empty_metrics
-    cvr_metrics_masked = compute_binary_metrics(y_cvr, cvr_logit, mask=click_mask > 0.5) if use_cvr else empty_metrics
+    if use_cvr:
+        if use_esmm:
+            cvr_metrics_masked = compute_binary_metrics(
+                y_cvr, p_cvr_logit if p_cvr_logit is not None else np.array([]), mask=(y_ctr > 0.5)
+            )
+            ctcvr_metrics = compute_binary_metrics(y_ctcvr, cvr_logit) if (y_ctcvr is not None) else empty_metrics
+        else:
+            cvr_metrics_masked = compute_binary_metrics(y_cvr, cvr_logit, mask=click_mask > 0.5)
+            ctcvr_metrics = empty_metrics
+    else:
+        cvr_metrics_masked = empty_metrics
+        ctcvr_metrics = empty_metrics
 
     ctr_wide_metrics = compute_binary_metrics(y_ctr, ctr_wide_logit) if (use_ctr and ctr_wide_logit.size) else empty_metrics
 
     ece_ctr = compute_ece_from_logits(y_ctr, ctr_logit) if use_ctr else {"ece": None, "bins": []}
-    ece_cvr_masked = (
-        compute_ece_from_logits(y_cvr, cvr_logit, mask=click_mask > 0.5) if use_cvr else {"ece": None, "bins": []}
-    )
+    if use_cvr:
+        if use_esmm:
+            ece_cvr_masked = compute_ece_from_logits(
+                y_cvr, p_cvr_logit if p_cvr_logit is not None else np.array([]), mask=(y_ctr > 0.5)
+            )
+        else:
+            ece_cvr_masked = compute_ece_from_logits(y_cvr, cvr_logit, mask=click_mask > 0.5)
+    else:
+        ece_cvr_masked = {"ece": None, "bins": []}
 
     pred_ctr_prob = sigmoid(torch.from_numpy(ctr_logit)).numpy() if use_ctr and ctr_logit.size > 0 else np.array([])
-    pred_cvr_prob = sigmoid(torch.from_numpy(cvr_logit)).numpy() if use_cvr and cvr_logit.size > 0 else np.array([])
+    if use_cvr and cvr_logit.size > 0:
+        if use_esmm:
+            pred_cvr_prob = sigmoid(torch.from_numpy(cvr_logit)).numpy() / (pred_ctr_prob + esmm_eps)
+        else:
+            pred_cvr_prob = sigmoid(torch.from_numpy(cvr_logit)).numpy()
+    else:
+        pred_cvr_prob = np.array([])
     funnel_stats = None
     if use_ctr and use_cvr and pred_ctr_prob.size and pred_cvr_prob.size:
         funnel_stats = funnel_consistency(
@@ -292,14 +367,17 @@ def run_eval(
         "run_dir": str(resolved_run_dir),
         "ctr_auc": ctr_metrics["auc"] if use_ctr else None,
         "cvr_auc_masked": cvr_metrics_masked["auc"] if use_cvr else None,
+        "ctcvr_auc": ctcvr_metrics["auc"] if use_cvr and use_esmm else None,
         "ctr_logloss": ctr_metrics["logloss"] if use_ctr else None,
         "cvr_logloss_masked": cvr_metrics_masked["logloss"] if use_cvr else None,
+        "ctcvr_logloss": ctcvr_metrics["logloss"] if use_cvr and use_esmm else None,
         "ctr_wide_only_auc": ctr_wide_metrics["auc"] if use_ctr else None,
         "ctr_wide_only_logloss": ctr_wide_metrics["logloss"] if use_ctr else None,
         "ece_ctr": ece_ctr["ece"] if use_ctr else None,
         "ece_cvr_masked": ece_cvr_masked["ece"] if use_cvr else None,
         "ctr": ctr_metrics,
         "cvr_masked": cvr_metrics_masked,
+        "ctcvr": ctcvr_metrics if use_cvr and use_esmm else empty_metrics,
         "ece_ctr_bins": ece_ctr.get("bins") if use_ctr else [],
         "ece_cvr_bins": ece_cvr_masked.get("bins") if use_cvr else [],
         "funnel_gap_stats": funnel_stats,
@@ -309,6 +387,15 @@ def run_eval(
         "ctr_logit_parts_stats": ctr_parts_stats,
         "logit_parts_decomposable": logit_parts_decomposable,
     }
+
+    if use_esmm:
+        # bridge legacy keys so schema enrichment can add clearer ESMM names without dropping old fields
+        result.setdefault("n_rows", result.get("n"))
+        result.setdefault("mask_cvr_sum", result.get("n"))  # exposures count per eval
+        result.setdefault("n_masked_train", result.get("n_masked"))
+        result.setdefault("auc_cvr", result.get("cvr_auc_masked"))
+        result.setdefault("loss_cvr", result.get("ctcvr_logloss"))
+        result = apply_esmm_schema(result, use_esmm=True)
 
     with eval_path.open("w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
@@ -323,6 +410,12 @@ def run_eval(
     if use_cvr:
         log_parts.append(f"cvr_auc_masked={cvr_metrics_masked['auc']}")
         log_parts.append(f"cvr_logloss_masked={cvr_metrics_masked['logloss']}")
+        if use_esmm:
+            log_parts.append(f"ctcvr_auc={ctcvr_metrics['auc']}")
+            log_parts.append(f"ctcvr_logloss={ctcvr_metrics['logloss']}")
+            log_parts.append(f"auc_cvr_click={cvr_metrics_masked['auc']}")
+            log_parts.append(f"n_exposure={result.get('n')}")
+            log_parts.append(f"n_click={result.get('n_masked')}")
         log_parts.append(f"ece_cvr_masked={ece_cvr_masked['ece']}")
     else:
         log_parts.append("cvr=disabled")

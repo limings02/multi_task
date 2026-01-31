@@ -59,15 +59,29 @@ def _select_shared_params(model, fallback_cap: int = 20) -> List[Tuple[str, torc
     return fallback
 
 
-def _flatten_grads(params: Sequence[Tuple[str, torch.nn.Parameter]]) -> torch.Tensor | None:
+def _flatten_grads(params: Sequence[Tuple[str, torch.nn.Parameter]]) -> Tuple[torch.Tensor | None, int, int]:
+    """
+    Flatten dense gradients into a 1D tensor.
+
+    Returns:
+        flat_grad: concatenated dense grads or None if empty
+        num_dense: number of dense grads included
+        num_sparse_skipped: number of sparse grads skipped
+    """
     grads = []
+    num_sparse_skipped = 0
+    num_dense = 0
     for _, p in params:
         if p.grad is None:
             continue
+        if p.grad.is_sparse:
+            num_sparse_skipped += 1
+            continue
+        num_dense += 1
         grads.append(p.grad.detach().reshape(-1))
     if not grads:
-        return None
-    return torch.cat(grads)
+        return None, num_dense, num_sparse_skipped
+    return torch.cat(grads), num_dense, num_sparse_skipped
 
 
 def _compute_grad_percentiles(values: List[float]) -> Tuple[float | None, float | None, float | None]:
@@ -81,7 +95,7 @@ def _compute_grad_percentiles(values: List[float]) -> Tuple[float | None, float 
 def train_one_epoch(
     model,
     loader,
-    optimizer,
+    optimizer_bundle,
     loss_fn,
     device,
     logger,
@@ -108,6 +122,7 @@ def train_one_epoch(
     """
     model.train()
     enabled_heads = getattr(loss_fn, "enabled_heads", {"ctr", "cvr"})
+    use_esmm = bool(getattr(loss_fn, "use_esmm", False))
     has_ctr = "ctr" in enabled_heads
     has_cvr = "cvr" in enabled_heads
 
@@ -139,7 +154,7 @@ def train_one_epoch(
         labels = _to_device_labels(labels, device)
         features_dev = _to_device_features(features, device)
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer_bundle.zero_grad(set_to_none=True)
         # Autocast only on CUDA to avoid CPU precision issues.
         with torch_amp.autocast(device_type=amp_device_type, enabled=amp_enabled, dtype=amp_dtype):
             outputs = model(features_dev)
@@ -228,19 +243,18 @@ def train_one_epoch(
             if log_loss_debug and hasattr(logger, "debug"):
                 logger.debug("skip backward/step at step=%d because mask_cvr_sum==0 in CVR-only batch", step + 1)
         else:
-            if amp_enabled and scaler is not None:
+            if amp_enabled and scaler is not None and scaler.is_enabled():
                 scaler.scale(loss).backward()
                 if grad_clip_norm is not None:
                     # unscale before clipping, otherwise clipping would operate on scaled grads.
-                    scaler.unscale_(optimizer)
-                    clip_grad_norm_(model.parameters(), grad_clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                    optimizer_bundle.unscale_(scaler)
+                    clip_grad_norm_(optimizer_bundle.dense_params, grad_clip_norm)
+                optimizer_bundle.step(scaler)
             else:
                 loss.backward()
                 if grad_clip_norm is not None:
-                    clip_grad_norm_(model.parameters(), grad_clip_norm)
-                optimizer.step()
+                    clip_grad_norm_(optimizer_bundle.dense_params, grad_clip_norm)
+                optimizer_bundle.step()
 
         # aggregate stats
         B = int(labels["y_ctr"].shape[0])
@@ -278,27 +292,29 @@ def train_one_epoch(
         if should_sample_grad:
             # Gradient diagnostics run on the same cadence as logging.
             # We isolate them from real updates by zeroing before/after and skipping optimizer.step().
-            optimizer.zero_grad(set_to_none=True)
+            optimizer_bundle.zero_grad(set_to_none=True)
             # Keep diagnostics in full precision to avoid mixing scaled grads into analysis.
             with torch_amp.autocast(enabled=False,device_type='cuda'):
                 diag_out_ctr = model(features_dev)
                 loss_ctr_diag = F.binary_cross_entropy_with_logits(diag_out_ctr["ctr"], labels["y_ctr"], reduction="mean")
             loss_ctr_diag.backward()
-            g_ctr = _flatten_grads(shared_params)
-            optimizer.zero_grad(set_to_none=True)
+            g_ctr, dense_cnt_ctr, sparse_skip_ctr = _flatten_grads(shared_params)
+            optimizer_bundle.zero_grad(set_to_none=True)
 
             with torch_amp.autocast(enabled=False,device_type='cuda'):
                 diag_out_cvr = model(features_dev)
                 mask = labels["click_mask"]
                 mask_sum = float(mask.sum().item())
                 g_cvr = None
+                dense_cnt_cvr = 0
+                sparse_skip_cvr = 0
                 if mask_sum > 0:
                     # Masked CVR loss keeps denominator=mask_sum so it matches the training objective (conditional on clicks).
                     loss_vec = F.binary_cross_entropy_with_logits(diag_out_cvr["cvr"], labels["y_cvr"], reduction="none")
                     loss_cvr_diag = (loss_vec * mask).sum() / (mask.sum() + EPS)
                     loss_cvr_diag.backward()
-                    g_cvr = _flatten_grads(shared_params)
-            optimizer.zero_grad(set_to_none=True)
+                    g_cvr, dense_cnt_cvr, sparse_skip_cvr = _flatten_grads(shared_params)
+            optimizer_bundle.zero_grad(set_to_none=True)
 
             if g_ctr is not None and g_cvr is not None:
                 norm_ctr = torch.norm(g_ctr)
@@ -316,24 +332,47 @@ def train_one_epoch(
                 grad_cos_vals.append(cosine_val)
                 conflict_hits += int(cosine_val < 0.0)
                 grad_samples += 1
+            else:
+                # record skips for visibility
+                if logger:
+                    logger.debug(
+                        "grad_diag: skipped cosine computation (dense counts ctr=%s cvr=%s, sparse_skipped ctr=%s cvr=%s)",
+                        dense_cnt_ctr,
+                        dense_cnt_cvr,
+                        sparse_skip_ctr,
+                        sparse_skip_cvr,
+                    )
 
-        if (step + 1) % log_every == 0:
-            elapsed = time.time() - t_start
-            log_parts = [
-                f"epoch={epoch} step={step+1}",
-                f"loss_total={loss_dict['loss_total']:.4f}",
-            ]
-            if has_ctr:
-                log_parts.append(f"loss_ctr={loss_dict.get('loss_ctr', 0.0):.4f}")
-            else:
-                log_parts.append("loss_ctr=0.0000(disabled)")
-            if has_cvr:
-                log_parts.append(f"loss_cvr={loss_dict.get('loss_cvr', 0.0):.4f}")
-                log_parts.append(f"mask_sum={loss_dict.get('mask_cvr_sum', 0.0):.1f}")
-            else:
-                log_parts.append("loss_cvr=0.0000(disabled)")
-            log_parts.append(f"time={elapsed:.2f}s")
-            logger.info(" ".join(log_parts))
+            if (step + 1) % log_every == 0:
+                elapsed = time.time() - t_start
+                log_parts = [
+                    f"epoch={epoch} step={step+1}",
+                    f"loss_total={loss_dict['loss_total']:.4f}",
+                ]
+                log_parts.append(f"mode={'esmm' if use_esmm else 'legacy'}")
+                if has_ctr:
+                    log_parts.append(f"loss_ctr={loss_dict.get('loss_ctr', 0.0):.4f}")
+                else:
+                    log_parts.append("loss_ctr=0.0000(disabled)")
+                if has_cvr:
+                    if use_esmm:
+                        log_parts.append(f"loss_ctcvr={loss_dict.get('loss_cvr', 0.0):.4f}")
+                        log_parts.append(f"n_exposure_batch={loss_dict.get('mask_cvr_sum', 0.0):.1f}")
+                        log_parts.append("aliases(loss_cvr->loss_ctcvr,mask_sum->n_exposure_batch)")
+                    else:
+                        log_parts.append(f"loss_cvr={loss_dict.get('loss_cvr', 0.0):.4f}")
+                        log_parts.append(f"mask_sum={loss_dict.get('mask_cvr_sum', 0.0):.1f}")
+                else:
+                    log_parts.append("loss_cvr=0.0000(disabled)")
+                if has_ctr:
+                    mode = loss_dict.get("pos_weight_mode")
+                    if mode:
+                        log_parts.append(f"pos_weight_mode={mode}")
+                    ctr_pw = loss_dict.get("pos_weight_ctr")
+                    if ctr_pw is not None:
+                        log_parts.append(f"ctr_pos_w={ctr_pw:.3f}")
+                log_parts.append(f"time={elapsed:.2f}s")
+                logger.info(" ".join(log_parts))
 
         if eval_every_steps and validate_fn and (current_global_step % eval_every_steps == 0):
             # Mid-epoch validation at the same cadence as training logs.
@@ -404,6 +443,8 @@ def validate(
 ) -> Dict[str, float]:
     model.eval()
     enabled_heads = getattr(loss_fn, "enabled_heads", {"ctr", "cvr"})
+    use_esmm = bool(getattr(loss_fn, "use_esmm", False))
+    esmm_eps = float(getattr(loss_fn, "esmm_eps", 1e-8))
     has_ctr = "ctr" in enabled_heads
     has_cvr = "cvr" in enabled_heads
 
@@ -420,9 +461,12 @@ def validate(
 
     y_ctr_list: List[torch.Tensor] = []
     y_cvr_list: List[torch.Tensor] = []
+    y_ctcvr_list: List[torch.Tensor] = []
     click_mask_list: List[torch.Tensor] = []
     ctr_logit_list: List[torch.Tensor] = []
     cvr_logit_list: List[torch.Tensor] = []
+    ctcvr_logit_list: List[torch.Tensor] = []
+    p_cvr_logit_list: List[torch.Tensor] = []
 
     with torch.no_grad():
         for step, (labels, features, meta) in enumerate(loader):
@@ -452,12 +496,35 @@ def validate(
                     ctr_logit_list.append(ctr_logit.detach().cpu())
                     y_ctr_list.append(labels["y_ctr"].detach().cpu())
                 if has_cvr:
-                    cvr_logit = outputs["cvr"]
-                    if cvr_logit.dim() > 1:
-                        cvr_logit = cvr_logit.view(-1)
-                    cvr_logit_list.append(cvr_logit.detach().cpu())
-                    y_cvr_list.append(labels["y_cvr"].detach().cpu())
-                    click_mask_list.append(labels["click_mask"].detach().cpu())
+                    if use_esmm:
+                        ctcvr_logit = outputs.get("ctcvr", outputs.get("cvr"))
+                        if ctcvr_logit is None:
+                            raise KeyError("ctcvr/cvr logit missing in outputs during validation")
+                        if ctcvr_logit.dim() > 1:
+                            ctcvr_logit = ctcvr_logit.view(-1)
+                        ctcvr_logit_list.append(ctcvr_logit.detach().cpu())
+                        y_ctcvr_list.append(labels["y_ctcvr"].detach().cpu())
+
+                        # Derived CVR (post-click) probability for optional monitoring
+                        ctr_logit = outputs["ctr"]
+                        if ctr_logit.dim() > 1:
+                            ctr_logit = ctr_logit.view(-1)
+                        p_ctr = torch.sigmoid(ctr_logit)
+                        p_ctcvr = torch.sigmoid(ctcvr_logit)
+                        p_cvr = p_ctcvr / (p_ctr + esmm_eps)
+                        p_cvr = torch.clamp(p_cvr, max=1.0)
+                        p_cvr_logit = torch.log(p_cvr / torch.clamp(1.0 - p_cvr, min=esmm_eps))
+                        p_cvr_logit_list.append(p_cvr_logit.detach().cpu())
+                        y_cvr_list.append(labels["y_cvr"].detach().cpu())
+                        click_mask_list.append(labels["y_ctr"].detach().cpu())  # click subset mask
+                        cvr_logit_list.append(ctcvr_logit.detach().cpu())  # keep for logging symmetry
+                    else:
+                        cvr_logit = outputs["cvr"]
+                        if cvr_logit.dim() > 1:
+                            cvr_logit = cvr_logit.view(-1)
+                        cvr_logit_list.append(cvr_logit.detach().cpu())
+                        y_cvr_list.append(labels["y_cvr"].detach().cpu())
+                        click_mask_list.append(labels["click_mask"].detach().cpu())
 
             tot_loss += loss_dict["loss_total"]
             tot_ctr += loss_dict.get("loss_ctr", 0.0)
@@ -483,15 +550,28 @@ def validate(
                     f"[val] epoch={epoch} step={step+1}",
                     f"loss_total={loss_dict['loss_total']:.4f}",
                 ]
+                log_parts.append(f"mode={'esmm' if use_esmm else 'legacy'}")
                 if has_ctr:
                     log_parts.append(f"loss_ctr={loss_dict.get('loss_ctr', 0.0):.4f}")
                 else:
                     log_parts.append("loss_ctr=0.0000(disabled)")
                 if has_cvr:
-                    log_parts.append(f"loss_cvr={loss_dict.get('loss_cvr', 0.0):.4f}")
-                    log_parts.append(f"mask_sum={loss_dict.get('mask_cvr_sum', 0.0):.1f}")
+                    if use_esmm:
+                        log_parts.append(f"loss_ctcvr={loss_dict.get('loss_cvr', 0.0):.4f}")
+                        log_parts.append(f"n_exposure_batch={loss_dict.get('mask_cvr_sum', 0.0):.1f}")
+                        log_parts.append("aliases(loss_cvr->loss_ctcvr,mask_sum->n_exposure_batch)")
+                    else:
+                        log_parts.append(f"loss_cvr={loss_dict.get('loss_cvr', 0.0):.4f}")
+                        log_parts.append(f"mask_sum={loss_dict.get('mask_cvr_sum', 0.0):.1f}")
                 else:
                     log_parts.append("loss_cvr=0.0000(disabled)")
+                if has_ctr:
+                    mode = loss_dict.get("pos_weight_mode")
+                    if mode:
+                        log_parts.append(f"pos_weight_mode={mode}")
+                    ctr_pw = loss_dict.get("pos_weight_ctr")
+                    if ctr_pw is not None:
+                        log_parts.append(f"ctr_pos_w={ctr_pw:.3f}")
                 log_parts.append(f"time={elapsed:.2f}s")
                 logger.info(" ".join(log_parts))
 
@@ -509,9 +589,10 @@ def validate(
     if mean_ctr_scaled is not None and mean_cvr_scaled is not None:
         loss_ratio_scaled = float(mean_cvr_scaled / (mean_ctr_scaled + EPS))
 
-    auc_ctr = auc_cvr = auc_primary = None
+    auc_ctr = auc_cvr = auc_ctcvr = auc_primary = None
     if calc_auc:
         auc_vals = []
+        ctr_metrics = cvr_metrics = ctcvr_metrics = None
         if has_ctr and y_ctr_list:
             ctr_metrics = compute_binary_metrics(
                 torch.cat(y_ctr_list).numpy(), torch.cat(ctr_logit_list).numpy()
@@ -520,15 +601,32 @@ def validate(
             if auc_ctr is not None:
                 auc_vals.append(auc_ctr)
         if has_cvr and y_cvr_list:
-            mask_arr = torch.cat(click_mask_list).numpy()
-            cvr_metrics = compute_binary_metrics(
-                torch.cat(y_cvr_list).numpy(),
-                torch.cat(cvr_logit_list).numpy(),
-                mask=mask_arr > 0.5,
-            )
-            auc_cvr = cvr_metrics.get("auc")
-            if auc_cvr is not None:
+            if use_esmm and p_cvr_logit_list:
+                # CVR evaluated on clicked subset via derived p_cvr
+                mask_arr = torch.cat(click_mask_list).numpy()  # y_ctr used as mask
+                cvr_metrics = compute_binary_metrics(
+                    torch.cat(y_cvr_list).numpy(),
+                    torch.cat(p_cvr_logit_list).numpy(),
+                    mask=mask_arr > 0.5,
+                )
+                auc_cvr = cvr_metrics.get("auc")
+            else:
+                mask_arr = torch.cat(click_mask_list).numpy()
+                cvr_metrics = compute_binary_metrics(
+                    torch.cat(y_cvr_list).numpy(),
+                    torch.cat(cvr_logit_list).numpy(),
+                    mask=mask_arr > 0.5,
+                )
+                auc_cvr = cvr_metrics.get("auc")
+            if auc_cvr is not None and not use_esmm:  # esmm keeps cvr as optional monitor, not part of primary auc
                 auc_vals.append(auc_cvr)
+        if use_esmm and y_ctcvr_list and ctcvr_logit_list:
+            ctcvr_metrics = compute_binary_metrics(
+                torch.cat(y_ctcvr_list).numpy(), torch.cat(ctcvr_logit_list).numpy()
+            )
+            auc_ctcvr = ctcvr_metrics.get("auc")
+            if auc_ctcvr is not None:
+                auc_vals.append(auc_ctcvr)
         if auc_vals:
             auc_primary = float(sum(auc_vals) / len(auc_vals))
 
@@ -557,6 +655,7 @@ def validate(
         "grad_cosine_p90": None,
         "auc_ctr": auc_ctr,
         "auc_cvr": auc_cvr,
+        "auc_ctcvr": auc_ctcvr,
         "auc_primary": auc_primary,
     }
 

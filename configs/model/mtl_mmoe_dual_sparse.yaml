@@ -1,0 +1,89 @@
+experiment:
+  name: "deepfm_mmoe_dual_sparse"
+
+data:
+  metadata_path: "data/processed/metadata.json"
+  batch_size: 256
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  drop_last: false
+  debug: false
+  seed: 20260127
+  neg_keep_prob_train: 0.4
+
+embedding:
+  default_embedding_dim: 8
+  embedding_dim_overrides: {}
+  mode: "sum"
+  sparse_grad: true
+
+model:
+  name: "deepfm_mmoe"
+  mtl: "mmoe"
+  enabled_heads: ["ctr", "cvr"]
+  tasks: ["ctr", "cvr"]
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      ctr: { use_wide: true, use_fm: true }
+      cvr: { use_wide: false, use_fm: false }
+  mmoe:
+    num_experts: 4
+    expert_mlp_dims: [128]
+    gate_type: "linear"
+    gate_hidden_dims: []
+    input: "deep_h"
+    dropout: 0.0
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    ctr: {}
+    cvr: {}
+  deep_hidden_dims: [256, 128]
+  deep_dropout: 0.2
+  deep_activation: "relu"
+  deep_use_bn: false
+  fm_enabled: true
+  fm_projection_dim: 16
+  out_dim: 128
+
+optim:
+  type: dual_sparse_dense
+  dense:
+    lr: 0.001
+    weight_decay: 1e-6
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  sparse:
+    enabled: true
+    lr: 0.002
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    allow_fallback_if_empty: false
+
+loss:
+  w_ctr: 1.0
+  w_cvr: 1.0
+  eps: 1.0e-6
+
+runtime:
+  device: "cuda"
+  epochs: 1
+  log_every: 100
+  amp: false
+  grad_diag_enabled: false
+  max_train_steps: 200
+  max_valid_steps: 50
+  grad_clip_norm: 1.0
+  seed: 20260127
+  resume_path: null
+  auto_eval: false
+  auto_eval_split: "valid"
+  auto_eval_save_preds: false
+  auto_eval_ckpt: "best"
+  save_last: false

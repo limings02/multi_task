@@ -15,7 +15,17 @@ def _bce_with_mask(pred, target, mask):
 
 
 def test_model_forward_shared_bottom():
-    cfg = load_yaml("configs/models/backbone_deepfm.yaml")
+    cfg = load_yaml("configs/model/backbone_deepfm.yaml")
+
+    # Add minimal data/runtime overrides for quick test
+    cfg.setdefault("data", {})
+    cfg["data"].setdefault("metadata_path", "data/processed/metadata.json")
+    cfg["data"].setdefault("batch_size", 8)
+    cfg["data"].setdefault("num_workers", 0)
+    cfg["data"].setdefault("pin_memory", False)
+    cfg["data"].setdefault("persistent_workers", False)
+    cfg["data"].setdefault("drop_last", False)
+    cfg["data"].setdefault("debug", False)
 
     # build feature_meta for dataloader & model
     feature_meta = build_model_feature_meta(Path(cfg["data"]["metadata_path"]), cfg["embedding"])
@@ -53,7 +63,7 @@ def test_model_forward_shared_bottom():
 
 
 def test_falsy_head_cfg_not_overridden():
-    cfg = load_yaml("configs/models/backbone_deepfm.yaml")
+    cfg = load_yaml("configs/model/backbone_deepfm.yaml")
 
     # inject head overrides to test falsy handling
     cfg.setdefault("model", {})
@@ -63,6 +73,12 @@ def test_falsy_head_cfg_not_overridden():
         "default": {"mlp_dims": [64], "dropout": 0.5, "use_bn": True},
         "ctr": {"mlp_dims": [], "dropout": 0.0, "use_bn": False},
     }
+    cfg.setdefault("data", {})
+    cfg["data"].setdefault("metadata_path", "data/processed/metadata.json")
+    cfg["data"].setdefault("batch_size", 4)
+    cfg["data"].setdefault("num_workers", 0)
+    cfg["data"].setdefault("pin_memory", False)
+    cfg["data"].setdefault("persistent_workers", False)
 
     feature_meta = build_model_feature_meta(Path(cfg["data"]["metadata_path"]), cfg["embedding"])
     loader = make_dataloader(
@@ -88,3 +104,45 @@ def test_falsy_head_cfg_not_overridden():
     labels, features, meta = next(iter(loader))
     out = model(features)
     assert out["ctr"].shape[0] == labels["y_ctr"].shape[0]
+
+
+def test_model_forward_mmoe():
+    cfg = load_yaml("configs/experiments/mtl_mmoe.yaml")
+
+    # speed up for unit test
+    cfg["data"]["batch_size"] = 8
+    cfg["data"]["num_workers"] = 0
+    cfg["runtime"]["device"] = "cpu"
+
+    feature_meta = build_model_feature_meta(Path(cfg["data"]["metadata_path"]), cfg["embedding"])
+
+    loader = make_dataloader(
+        split="train",
+        batch_size=cfg["data"]["batch_size"],
+        num_workers=cfg["data"]["num_workers"],
+        shuffle=False,
+        drop_last=False,
+        pin_memory=False,
+        persistent_workers=False,
+        seed=42,
+        feature_meta=feature_meta,
+        debug=False,
+    )
+
+    model = build_model(cfg)
+    model.train()
+
+    labels, features, meta = next(iter(loader))
+    out = model(features)
+
+    assert "ctr" in out and "cvr" in out
+    B = labels["y_ctr"].shape[0]
+    assert out["ctr"].shape == (B,)
+    assert out["cvr"].shape == (B,)
+    assert torch.isfinite(out["ctr"]).all()
+    assert torch.isfinite(out["cvr"]).all()
+
+    loss_ctr = F.binary_cross_entropy_with_logits(out["ctr"], labels["y_ctr"])
+    loss_cvr = _bce_with_mask(out["cvr"], labels["y_cvr"], labels["click_mask"])
+    loss = loss_ctr + loss_cvr
+    loss.backward()

@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from src.models.backbones.deepfm import DeepFMBackbone
 from src.models.mtl.shared_bottom import SharedBottom
+from src.models.mtl.mmoe import MMoE
 from src.utils.config import load_yaml
 
 try:
@@ -54,35 +55,46 @@ def _build_backbone(cfg: Dict[str, Any], feature_meta: Dict[str, Any]) -> nn.Mod
     model_cfg = cfg.get("model", {})
     # backward-compatible: model/backbone nesting
     backbone_cfg = model_cfg.get("backbone", model_cfg)
+    embedding_cfg = cfg.get("embedding", {})
 
-    use_legacy = bool(backbone_cfg.get("use_legacy_pseudo_deepfm", True))
-    return_parts = bool(backbone_cfg.get("return_logit_parts", False))
+    def _pick(key: str, default=None):
+        if key in backbone_cfg and backbone_cfg.get(key) is not None:
+            return backbone_cfg.get(key)
+        if key in model_cfg and model_cfg.get(key) is not None:
+            return model_cfg.get(key)
+        return default
+
+    use_legacy = bool(_pick("use_legacy_pseudo_deepfm", True))
+    return_parts = bool(_pick("return_logit_parts", False))
+    sparse_grad = bool(embedding_cfg.get("sparse_grad", False))
 
     return DeepFMBackbone(
         feature_meta=feature_meta,
-        deep_hidden_dims=list(backbone_cfg.get("deep_hidden_dims", [])),
-        deep_dropout=float(backbone_cfg.get("deep_dropout", 0.0)),
-        deep_activation=str(backbone_cfg.get("deep_activation", "relu")),
-        deep_use_bn=bool(backbone_cfg.get("deep_use_bn", False)),
-        fm_enabled=bool(backbone_cfg.get("fm_enabled", True)),
+        deep_hidden_dims=list(_pick("deep_hidden_dims", [])),
+        deep_dropout=float(_pick("deep_dropout", 0.0)),
+        deep_activation=str(_pick("deep_activation", "relu")),
+        deep_use_bn=bool(_pick("deep_use_bn", False)),
+        fm_enabled=bool(_pick("fm_enabled", True)),
         fm_projection_dim=(
             None
-            if backbone_cfg.get("fm_projection_dim") is None
-            else int(backbone_cfg.get("fm_projection_dim"))
+            if _pick("fm_projection_dim") is None
+            else int(_pick("fm_projection_dim"))
         ),
-        out_dim=int(backbone_cfg.get("out_dim", 128)),
+        out_dim=int(_pick("out_dim", 128)),
         use_legacy_pseudo_deepfm=use_legacy,
         return_logit_parts=return_parts,
+        sparse_grad=sparse_grad,
     )
 
 
 def build_model(cfg: Dict[str, Any], feature_map: Dict[str, Any] | None = None, meta: Dict[str, Any] | None = None) -> nn.Module:
     """
-    Assemble model according to cfg. Currently supports only DeepFM + SharedBottom.
+    Assemble model according to cfg. Supports SharedBottom (default) and MMoE.
     """
     model_cfg = cfg.get("model", {})
     enabled_heads = model_cfg.get("enabled_heads") or ["ctr", "cvr"]
     name = model_cfg.get("name") or "deepfm_shared_bottom"
+    mtl = str(model_cfg.get("mtl", "sharedbottom")).lower()
 
     feature_meta = _resolve_feature_meta(cfg)
     backbone = _build_backbone(cfg, feature_meta)
@@ -100,15 +112,31 @@ def build_model(cfg: Dict[str, Any], feature_map: Dict[str, Any] | None = None, 
     use_legacy = bool(model_cfg.get("backbone", {}).get("use_legacy_pseudo_deepfm", model_cfg.get("use_legacy_pseudo_deepfm", True)))
     return_parts = bool(model_cfg.get("backbone", {}).get("return_logit_parts", model_cfg.get("return_logit_parts", False)))
 
-    return SharedBottom(
-        backbone=backbone,
-        head_cfg=head_cfg,
-        enabled_heads=enabled_heads,
-        use_legacy_pseudo_deepfm=use_legacy,
-        return_logit_parts=return_parts,
-        per_head_add=per_head_add,
-        head_priors=label_priors,
-    )
+    if mtl in {"sharedbottom", "shared_bottom"}:
+        return SharedBottom(
+            backbone=backbone,
+            head_cfg=head_cfg,
+            enabled_heads=enabled_heads,
+            use_legacy_pseudo_deepfm=use_legacy,
+            return_logit_parts=return_parts,
+            per_head_add=per_head_add,
+            head_priors=label_priors,
+        )
+
+    if mtl == "mmoe":
+        mmoe_cfg = model_cfg.get("mmoe", {})
+        return MMoE(
+            backbone=backbone,
+            head_cfg=head_cfg,
+            mmoe_cfg=mmoe_cfg,
+            enabled_heads=enabled_heads,
+            use_legacy_pseudo_deepfm=use_legacy,
+            return_logit_parts=return_parts,
+            per_head_add=per_head_add,
+            head_priors=label_priors,
+        )
+
+    raise ValueError(f"Unsupported model.mtl '{mtl}'. Expected 'sharedbottom' or 'mmoe'.")
 
 
 __all__ = ["build_model"]

@@ -13,6 +13,7 @@ import random
 from pathlib import Path
 from typing import Dict, Iterator, List, Tuple
 
+import logging
 import pyarrow.dataset as ds
 import torch
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info
@@ -117,12 +118,52 @@ def _collate_factory(feature_meta: Dict[str, Dict[str, bool]]):
     """
 
     def collate_fn(batch: List[Dict]):
+        log = logging.getLogger(__name__)
+        y_ctr_list: List[float] = []
+        y_cvr_list: List[float] = []
+        y_ctcvr_list: List[float] = []
+        click_mask_list: List[float] = []
+        row_id_list: List[int] = []
+        entity_list: List = []
+        funnel_bad = 0
+
+        for b in batch:
+            y_ctr = float(b.get("y_ctr", 0.0))
+            try:
+                y_cvr = float(b.get("y_cvr", 0.0))
+            except Exception:
+                y_cvr = 0.0
+            if y_ctr <= 0.0 and y_cvr > 0.0:
+                funnel_bad += 1
+                y_cvr = 0.0
+            if y_ctr <= 0.0:
+                y_cvr = 0.0
+
+            click_mask = b.get("click_mask")
+            if click_mask is None:
+                click_mask = 1.0 if y_ctr > 0.0 else 0.0
+            click_mask = float(click_mask)
+
+            y_ctcvr = 1.0 if (y_ctr > 0.5 and y_cvr > 0.5) else 0.0
+
+            y_ctr_list.append(y_ctr)
+            y_cvr_list.append(y_cvr)
+            y_ctcvr_list.append(y_ctcvr)
+            click_mask_list.append(click_mask)
+            row_id_list.append(int(b.get("row_id", len(row_id_list))))
+            entity_list.append(b.get("entity_id"))
+
+        if funnel_bad:
+            log.warning("funnel_bad detected: %d samples had y_cvr=1 while y_ctr=0; coerced y_cvr->0.", funnel_bad)
+
         labels = {
-            k: torch.tensor([b[k] for b in batch], dtype=torch.float32)
-            for k in ["y_ctr", "y_cvr", "y_ctcvr", "click_mask"]
+            "y_ctr": torch.tensor(y_ctr_list, dtype=torch.float32),
+            "y_cvr": torch.tensor(y_cvr_list, dtype=torch.float32),
+            "y_ctcvr": torch.tensor(y_ctcvr_list, dtype=torch.float32),
+            "click_mask": torch.tensor(click_mask_list, dtype=torch.float32),
+            "row_id": torch.tensor(row_id_list, dtype=torch.int64),
+            "entity_id": entity_list,
         }
-        labels["row_id"] = torch.tensor([b["row_id"] for b in batch], dtype=torch.int64)
-        labels["entity_id"] = [b["entity_id"] for b in batch]
 
         features: Dict[str, Dict[str, torch.Tensor | None]] = {}
         # Iterate over keys once to avoid repeated string ops.
