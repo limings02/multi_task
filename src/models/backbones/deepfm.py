@@ -227,6 +227,17 @@ class DeepFMBackbone(nn.Module):
             out = {"h": h_out, "logit_linear": linear_logit, "deep_h": deep_h}
             if fm_vec is not None:
                 out["fm_vec"] = fm_vec
+            
+            # ===== 新增：为 MMoEInputComposer 提供 embedding 聚合表示 =====
+            emb_stack = emb_out.get("emb_stack")  # [B, F, D] or None
+            out["emb_concat"] = emb_out["emb_concat"]  # 始终可用
+            if emb_stack is not None:
+                out["sum_emb"] = emb_stack.sum(dim=1)   # [B, D]
+                out["mean_emb"] = emb_stack.mean(dim=1)  # [B, D]
+            else:
+                out["sum_emb"] = None
+                out["mean_emb"] = None
+            
             # legacy mode keeps behaviour; decomposition handled upstream if requested
             return out
 
@@ -262,6 +273,25 @@ class DeepFMBackbone(nn.Module):
         }
         if fm_vec is not None:
             out["fm_vec"] = fm_vec
+        
+        # ===== 新增：为 MMoEInputComposer 提供 embedding 聚合表示 =====
+        # emb_stack: [B, F, D]（仅当所有 embedding 维度相同时可用）
+        # sum_emb: [B, D]（embedding sum pooling）
+        # mean_emb: [B, D]（embedding mean pooling）
+        # emb_concat: [B, F*D]（所有 embedding 拼接）
+        emb_stack = emb_out.get("emb_stack")  # [B, F, D] or None
+        out["emb_concat"] = emb_out["emb_concat"]  # 始终可用
+        
+        if emb_stack is not None:
+            # 所有 embedding 维度相同，可以做 sum/mean
+            out["sum_emb"] = emb_stack.sum(dim=1)   # [B, D]
+            out["mean_emb"] = emb_stack.mean(dim=1)  # [B, D]
+        else:
+            # 各 embedding 维度不同，无法直接 sum/mean
+            # 设为 None，composer 会在需要时报错
+            out["sum_emb"] = None
+            out["mean_emb"] = None
+        
         return out
 
 

@@ -125,6 +125,7 @@ def build_model(cfg: Dict[str, Any], feature_map: Dict[str, Any] | None = None, 
 
     if mtl == "mmoe":
         mmoe_cfg = model_cfg.get("mmoe", {})
+        log_gates = bool(mmoe_cfg.get("log_gates", False))
         return MMoE(
             backbone=backbone,
             head_cfg=head_cfg,
@@ -134,6 +135,7 @@ def build_model(cfg: Dict[str, Any], feature_map: Dict[str, Any] | None = None, 
             return_logit_parts=return_parts,
             per_head_add=per_head_add,
             head_priors=label_priors,
+            log_gates=log_gates,
         )
 
     raise ValueError(f"Unsupported model.mtl '{mtl}'. Expected 'sharedbottom' or 'mmoe'.")

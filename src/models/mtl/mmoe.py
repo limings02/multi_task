@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional, Set
 
 import torch
@@ -7,6 +8,9 @@ from torch import nn
 
 from src.models.backbones.layers import MLP
 from src.models.heads import TaskHead
+from src.models.mtl.composer import MMoEInputComposer, build_composer_from_config
+
+logger = logging.getLogger(__name__)
 
 
 class _Gate(nn.Module):
@@ -40,6 +44,7 @@ class MMoE(nn.Module):
 
     - Uses backbone-provided representations (default deep_h) as expert inputs.
     - Keeps head interface identical to SharedBottom: returns per-task logits with optional wide/FM additions.
+    - Optionally returns gate weights for health monitoring (controlled by log_gates flag).
     """
 
     def __init__(
@@ -52,6 +57,7 @@ class MMoE(nn.Module):
         return_logit_parts: bool = False,
         per_head_add: Optional[Dict[str, Dict[str, bool]]] = None,
         head_priors: Optional[Dict[str, float]] = None,
+        log_gates: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
@@ -59,28 +65,41 @@ class MMoE(nn.Module):
         self.return_logit_parts = bool(return_logit_parts)
         self.per_head_add = per_head_add or {}
         self.head_priors = head_priors or {}
+        self.log_gates = bool(log_gates)  # Flag to enable gate weight logging
 
         tasks = head_cfg.get("tasks") or ["ctr", "cvr"]
         enabled = enabled_heads or tasks
         self.tasks: List[str] = tasks
         self.enabled_heads: Set[str] = {h.lower() for h in enabled}
 
+        # ---- 构建可选的 input composer ----
+        # 当配置中有 add_fm_vec/add_emb 等新字段时，使用 composer 组装输入
+        # 否则走旧逻辑（直接使用 deep_h）
+        self.composer: Optional[MMoEInputComposer] = build_composer_from_config(backbone, mmoe_cfg)
+        
         # ---- resolve input dim ----
-        input_source = str(mmoe_cfg.get("input", "deep_h")).lower()
-        self.input_source = input_source
-
-        deep_dim = getattr(backbone, "deep_out_dim", getattr(backbone, "out_dim", None))
-        emb_concat_dim = getattr(getattr(backbone, "feat_emb", None), "concat_dim", None)
-
-        if input_source == "deep_h":
-            in_dim = deep_dim
-        elif input_source == "emb_concat":
-            in_dim = emb_concat_dim
+        if self.composer is not None:
+            # 使用 composer 输出维度
+            in_dim = self.composer.out_dim
+            logger.info(f"[MMoE] Using composer, input dim = {in_dim}")
         else:
-            raise ValueError(f"Unsupported mmoe.input value: {input_source}")
+            # 旧逻辑：直接使用 deep_h 或 emb_concat
+            input_source = str(mmoe_cfg.get("input", "deep_h")).lower()
+            self.input_source = input_source
 
-        if in_dim is None:
-            raise ValueError("MMoE: could not infer input dimension from backbone; ensure deep_out_dim or feat_emb.concat_dim is available.")
+            deep_dim = getattr(backbone, "deep_out_dim", getattr(backbone, "out_dim", None))
+            emb_concat_dim = getattr(getattr(backbone, "feat_emb", None), "concat_dim", None)
+
+            if input_source == "deep_h":
+                in_dim = deep_dim
+            elif input_source == "emb_concat":
+                in_dim = emb_concat_dim
+            else:
+                raise ValueError(f"Unsupported mmoe.input value: {input_source}")
+
+            if in_dim is None:
+                raise ValueError("MMoE: could not infer input dimension from backbone; ensure deep_out_dim or feat_emb.concat_dim is available.")
+            logger.info(f"[MMoE] Using legacy input_source='{input_source}', input dim = {in_dim}")
 
         self.in_dim = in_dim
         self.layernorm = nn.LayerNorm(in_dim)
@@ -161,7 +180,19 @@ class MMoE(nn.Module):
         return {"use_wide": True, "use_fm": True}
 
     def _select_input(self, features: Dict[str, torch.Tensor], backbone_out: Dict[str, torch.Tensor]) -> torch.Tensor:
-        if self.input_source == "deep_h":
+        """
+        选择 MMoE 的输入张量。
+        
+        如果配置了 composer，则使用 composer 组装输入；
+        否则走旧逻辑（直接使用 deep_h 或 emb_concat）。
+        """
+        # ===== 新路径：使用 composer =====
+        if self.composer is not None:
+            return self.composer(backbone_out)
+        
+        # ===== 旧路径：直接使用 deep_h 或 emb_concat =====
+        input_source = getattr(self, "input_source", "deep_h")
+        if input_source == "deep_h":
             x = backbone_out.get("deep_h")
             if x is None:
                 x = backbone_out.get("h")
@@ -202,11 +233,19 @@ class MMoE(nn.Module):
         if fm_logit is not None and fm_logit.dim() == 2 and fm_logit.size(-1) == 1:
             fm_logit = fm_logit.squeeze(-1)
 
+        # Collect gate weights if logging is enabled
+        gate_weights_dict: Dict[str, torch.Tensor] = {}
+
         for task, head in self.towers.items():
             if task not in self.enabled_heads:
                 continue
             gate = self.gates[task]
-            gate_w = gate(base_x)
+            gate_w = gate(base_x)  # [B, E]
+
+            # Store gate weights for health monitoring if enabled
+            if self.log_gates:
+                gate_weights_dict[task] = gate_w.detach()
+
             task_h = _mix(gate_w)
             task_logit = head(task_h)
 
@@ -240,8 +279,14 @@ class MMoE(nn.Module):
                 }
 
         results["logit_parts_decomposable"] = logit_parts_decomposable
-        if "aux" in out:
-            results["aux"] = out["aux"]
+
+        # Merge aux from backbone and add gate weights if logging is enabled
+        aux = dict(out.get("aux", {})) if "aux" in out else {}
+        if self.log_gates and gate_weights_dict:
+            aux["gates"] = gate_weights_dict
+        if aux:
+            results["aux"] = aux
+
         return results
 
 

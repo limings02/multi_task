@@ -191,13 +191,18 @@ class Trainer:
         opt_cfg = cfg.get("optim", {})
         self.optim_bundle = build_optimizer_bundle(cfg, self.model, scaler=self.scaler)
 
+        # ===== Load aux_focal configuration (方案1: ESMM 主链路 BCE + CTCVR Aux-Focal) =====
+        aux_focal_cfg = loss_cfg.get("aux_focal", {})
+        
         self.loss_fn = MultiTaskBCELoss(
             w_ctr=float(loss_cfg.get("w_ctr", 1.0)),
             w_cvr=float(loss_cfg.get("w_cvr", 1.0)),
             eps=float(loss_cfg.get("eps", 1e-6)),
             use_esmm=self.use_esmm,
+            esmm_version=str(cfg.get("esmm", {}).get("version", "v2")),  # "v2" (standard) or "legacy"
             lambda_ctr=float(cfg.get("esmm", {}).get("lambda_ctr", 1.0)),
             lambda_ctcvr=float(cfg.get("esmm", {}).get("lambda_ctcvr", 1.0)),
+            lambda_cvr_aux=float(cfg.get("esmm", {}).get("lambda_cvr_aux", 0.0)),  # CVR aux loss
             esmm_eps=float(cfg.get("esmm", {}).get("eps", 1e-8)),
             enabled_heads=self.enabled_heads,
             pos_weight_dynamic=bool(loss_cfg.get("pos_weight_dynamic", True)),
@@ -213,10 +218,50 @@ class Trainer:
             pos_weight_clip_ctcvr=(
                 float(pos_weight_clip_cfg["ctcvr"]) if "ctcvr" in pos_weight_clip_cfg else None
             ),
+            # Aux Focal parameters (defaults to disabled for backward compatibility)
+            aux_focal_enabled=bool(aux_focal_cfg.get("enabled", False)),
+            aux_focal_warmup_steps=int(aux_focal_cfg.get("warmup_steps", 2000)),
+            aux_focal_target_head=str(aux_focal_cfg.get("target_head", "ctcvr")),
+            aux_focal_lambda=float(aux_focal_cfg.get("lambda", 0.1)),
+            aux_focal_gamma=float(aux_focal_cfg.get("gamma", 1.0)),
+            aux_focal_use_alpha=bool(aux_focal_cfg.get("use_alpha", False)),
+            aux_focal_alpha=float(aux_focal_cfg.get("alpha", 0.25)),
+            aux_focal_detach_p_for_weight=bool(aux_focal_cfg.get("detach_p_for_weight", True)),
+            aux_focal_compute_fp32=bool(aux_focal_cfg.get("compute_fp32", True)),
+            aux_focal_log_components=bool(aux_focal_cfg.get("log_components", True)),
+            global_step=0,  # Will be updated in training loop
         )
+
+        # Log ESMM configuration
+        if self.use_esmm:
+            esmm_cfg = cfg.get("esmm", {})
+            self.logger.info(
+                "ESMM config: version=%s lambda_ctr=%.2f lambda_ctcvr=%.2f lambda_cvr_aux=%.2f",
+                esmm_cfg.get("version", "v2"),
+                esmm_cfg.get("lambda_ctr", 1.0),
+                esmm_cfg.get("lambda_ctcvr", 1.0),
+                esmm_cfg.get("lambda_cvr_aux", 0.0),
+            )
+            
+            # Log Aux Focal configuration if enabled
+            if aux_focal_cfg.get("enabled", False):
+                self.logger.info(
+                    "Aux Focal config: enabled=true warmup_steps=%d target_head=%s lambda=%.3f gamma=%.1f use_alpha=%s alpha=%.3f",
+                    aux_focal_cfg.get("warmup_steps", 2000),
+                    aux_focal_cfg.get("target_head", "ctcvr"),
+                    aux_focal_cfg.get("lambda", 0.1),
+                    aux_focal_cfg.get("gamma", 1.0),
+                    aux_focal_cfg.get("use_alpha", False),
+                    aux_focal_cfg.get("alpha", 0.25),
+                )
 
         self.best_metric: float = float("-inf")  # tracks best full AUC
         self.global_step = 0
+
+        # Health metrics logging (disabled by default for backward compatibility)
+        self.log_health_metrics = bool(runtime_cfg.get("log_health_metrics", False))
+        if self.log_health_metrics:
+            self.logger.info("Health metrics logging enabled (log_health_metrics=true)")
 
         resume_path = cfg.get("runtime", {}).get("resume_path")
         if resume_path:
@@ -263,6 +308,7 @@ class Trainer:
                     amp_dtype=self.amp_dtype,
                     amp_device_type=self.amp_device_type,
                     calc_auc=True,
+                    log_health_metrics=self.log_health_metrics,
                 )
 
             def _on_eval(val_metrics: Dict[str, Any], g_step: int, ep: int) -> None:
@@ -282,6 +328,10 @@ class Trainer:
                     )
                     self.logger.info(f"New best at step {g_step}: auc={self.best_metric:.4f}")
 
+            # Resolve gradient diagnostics parameters
+            grad_diag_every = runtime.get("grad_diag_every")  # None means use log_every
+            grad_diag_min_tasks = int(runtime.get("grad_diag_min_tasks", 2))
+
             train_metrics = train_one_epoch(
                 self.model,
                 self.train_loader,
@@ -295,6 +345,8 @@ class Trainer:
                 log_every=log_every,
                 global_step=self.global_step,
                 grad_diag_enabled=grad_diag_enabled,
+                grad_diag_every=grad_diag_every,
+                grad_diag_min_tasks=grad_diag_min_tasks,
                 eval_every_steps=eval_every_steps,
                 validate_fn=_validate_full,
                 eval_callback=_on_eval,
@@ -320,6 +372,7 @@ class Trainer:
                 amp_enabled=self.amp_enabled,
                 amp_dtype=self.amp_dtype,
                 calc_auc=True,
+                log_health_metrics=self.log_health_metrics,
             )
             valid_record = {"epoch": epoch, "split": "valid", **valid_metrics}
             self._write_metrics(valid_record)

@@ -4,9 +4,11 @@ experiment:
 # ESMM toggle (default off to preserve legacy behaviour)
 use_esmm: true
 esmm:
+  version: "v2"  # "v2" (standard ESMM: p_ctcvr = p_ctr * p_cvr) or "legacy" (deprecated)
   eps: 1.0e-8
   lambda_ctr: 1.0
   lambda_ctcvr: 1.0
+  lambda_cvr_aux: 0.2  # CVR auxiliary loss on click=1 subset; 0 to disable
 
 data:
   metadata_path: "data/processed/metadata.json"
@@ -25,7 +27,7 @@ sampling:
 embedding:
   default_embedding_dim: 8
   embedding_dim_overrides: {}
-  mode: "sum"
+  mode: "sum"  # 其实是mean，只是因为iterdataset不允许，后面转为手动实现了
   sparse_grad: true
 
 model:
@@ -45,7 +47,15 @@ model:
     gate_type: "linear"
     gate_hidden_dims: []
     input: "deep_h"
-    dropout: 0.0
+    dropout: 0.1
+    log_gates: true  # Enable gate weight logging for health metrics
+    # ===== 新增字段 =====
+    add_fm_vec: true       # 是否加入 fm_vec（FM 二阶向量）
+    add_emb: "mean"         # embedding 聚合方式: none|sum|mean|concat
+    part_proj_dim: 128      # 每个 part 投影到的统一维度；null 表示保留原维度
+    fusion: "concat"        # 融合方式: concat|sum
+    adapter_mlp_dims: [128]    # 融合后可选 MLP 层维度
+    norm: "none"            # 各 part 投影后的归一化: none|layernorm
   heads:
     default:
       mlp_dims: [128]
@@ -82,20 +92,46 @@ loss:
   eps: 1.0e-6
   pos_weight_dynamic: false
   static_pos_weight:
-    ctr: 24.7
-    ctcvr: 4800
+    ctr: 24.7          #24.7
+    ctcvr: 4800           #4800
   pos_weight_clip:
-    ctr: 100
-    ctcvr: 500
+    ctr: 30
+    ctcvr: 5000
+
+  # ===== 方案1: ESMM 主链路 BCE + CTCVR Aux-Focal（配置化 + warmup）=====
+  # 说明：
+  #   - CTR 损失保持 BCEWithLogitsLoss(pos_weight=24.7)
+  #   - CTCVR 损失 = BCE(pos_weight=4800) + aux_focal
+  #   - aux_focal 只作用于 CTCVR（不影响 CTR）
+  #   - warmup_steps 前不启用 focal，避免初期梯度不稳
+  #   - 关闭时 (enabled=false)，行为与原实现完全一致
+  # Sweep 建议：
+  #   - lambda: 0.05, 0.1, 0.2
+  #   - gamma: 1.0, 2.0
+  #   - warmup_steps: 1000, 2000
+  aux_focal:
+    enabled: true              # 开关：true 启用，false 禁用（默认禁用以保持向后兼容）
+    warmup_steps: 5000         # warmup 步数：前 N step 不启用 aux focal
+    target_head: "ctcvr"       # 目标 head（固定为 ctcvr，不要改为 ctr）
+    lambda: 0.1                # focal 辅助项系数（推荐 sweep: 0.05/0.1/0.2）
+    gamma: 1.0                 # focal gamma（推荐 sweep: 1.0/2.0；gamma 越大，easy samples 权重越低）
+    use_alpha: false           # 是否使用 alpha 平衡（避免与 pos_weight 叠加）
+    alpha: 0.25                # alpha 值（仅 use_alpha=true 时生效）
+    detach_p_for_weight: true  # focal 权重计算时 detach 概率梯度（推荐 true）
+    compute_fp32: true         # AMP 下权重计算使用 fp32（推荐 true，更稳定）
+    log_components: true       # 日志中记录 loss_ctcvr_bce 和 loss_ctcvr_focal
 
 runtime:
   device: "cuda"
   epochs: 1
-  log_every: 5000
+  log_every: 40
   amp: true
-  grad_diag_enabled: false
-  max_train_steps: 50000
-  max_valid_steps: 8000
+  grad_diag_enabled: true  # Enable new dynamic gradient diagnostics
+  grad_diag_every: 4000    # Run at same frequency as logging (null = use log_every)
+  grad_diag_min_tasks: 2   # Minimum tasks for shared param identification
+  log_health_metrics: true  # Enable health metrics logging
+  max_train_steps: 40
+  max_valid_steps: 8
   grad_clip_norm: 1.0
   seed: 20260127
   resume_path: null

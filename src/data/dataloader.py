@@ -99,8 +99,6 @@ def collate_fn_embeddingbag(
     if not bases:
         raise ValueError("No feature *_idx columns found in batch.")
 
-    B = len(batch)
-
     # Pre-pass: detect if any field uses values so we can align weights on the fly.
     any_use_value = False
     for base in bases:
@@ -111,14 +109,13 @@ def collate_fn_embeddingbag(
             break
 
     # 2) labels/meta with ESMM-friendly guards
-    log = logging.getLogger(__name__)
+    filtered_rows: List[Tuple[Dict, float, float]] = []
     y_ctr_list: List[float] = []
     y_cvr_list: List[float] = []
     y_ctcvr_list: List[float] = []
     click_mask_list: List[float] = []
     row_id_list: List[int] = []
     entity_id_list: List[Any] = []
-    funnel_bad = 0
 
     for row in batch:
         y_ctr = float(row.get("y_ctr", 0.0))
@@ -129,11 +126,17 @@ def collate_fn_embeddingbag(
             y_cvr = 0.0
 
         if y_ctr <= 0.0 and y_cvr > 0.0:
-            funnel_bad += 1
-            y_cvr = 0.0  # enforce funnel consistency: no conversion without click
+            continue  # drop funnel-inconsistent samples entirely
         if y_ctr <= 0.0:
             y_cvr = 0.0
+        filtered_rows.append((row, y_ctr, y_cvr))
 
+    if not filtered_rows:
+        raise ValueError("Batch empty after filtering funnel-inconsistent samples.")
+
+    B = len(filtered_rows)
+
+    for row, y_ctr, y_cvr in filtered_rows:
         click_mask = row.get("click_mask")
         if click_mask is None:
             click_mask = 1.0 if y_ctr > 0.0 else 0.0
@@ -147,9 +150,6 @@ def collate_fn_embeddingbag(
         click_mask_list.append(click_mask)
         row_id_list.append(int(row.get("row_id", len(row_id_list))))
         entity_id_list.append(row.get("entity_id"))
-
-    if funnel_bad:
-        log.warning("funnel_bad detected: %d samples had y_cvr=1 while y_ctr=0; coerced y_cvr->0.", funnel_bad)
 
     labels = {
         "y_ctr": torch.tensor(y_ctr_list, dtype=torch.float32),
@@ -165,7 +165,7 @@ def collate_fn_embeddingbag(
     weights_map: Dict[str, List[float]] = {base: [] for base in bases}
     offsets_map: Dict[str, List[int]] = {base: [] for base in bases}
 
-    for row_idx, row in enumerate(batch):
+    for row_idx, (row, _, _) in enumerate(filtered_rows):
         for base in bases:
             meta = feature_meta.get(base, {})
             is_multi = bool(meta.get("is_multi_hot", False))

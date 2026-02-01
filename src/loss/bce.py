@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+import warnings
+from typing import Any, Dict, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -8,10 +9,154 @@ import torch.nn.functional as F
 from src.loss.base import LossFn, get_labels
 
 
+# ============================================================================
+# Auxiliary Focal Loss (Logits Version)
+# ============================================================================
+
+def focal_on_logits_aux(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: Optional[float] = None,
+    detach_p_for_weight: bool = True,
+    compute_fp32: bool = True,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Auxiliary Focal Loss computed from logits for numerical stability and AMP compatibility.
+    
+    Focal loss downweights easy examples (high confidence correct predictions):
+    - For y=1 (positive): easy when p≈1 → (1-p) small → focal_factor≈0 → loss↓
+    - For y=0 (negative): easy when p≈0 → (1-p)≈1 and p_t=(1-p)≈1 → focal_factor≈0 → loss↓
+    
+    The key insight: easy negatives (y=0, p≈0) get focal_factor = (1 - p_t)^gamma ≈ 0,
+    strongly downweighting them. Hard examples retain full loss weight.
+    
+    Args:
+        logits: Model raw logits (before sigmoid), shape [N] or [N, ...]
+        targets: Binary labels {0, 1}, shape [N] or [N, ...]
+        gamma: Focal loss focusing parameter. Higher gamma → stronger downweighting of easy examples.
+               Typical: 1.0 or 2.0. gamma=0 → standard BCE.
+        alpha: Optional class balancing factor. If provided:
+               - Positives weighted by alpha
+               - Negatives weighted by (1-alpha)
+               Typical: 0.25 for positive class. None to disable.
+        detach_p_for_weight: If True, detach focal_factor from gradient graph to avoid
+                            extra gradient coupling. Recommended True for auxiliary losses.
+        compute_fp32: If True, compute focal weights in fp32 for numerical stability under AMP.
+        reduction: "mean", "sum", or "none".
+    
+    Returns:
+        Focal loss tensor (scalar if reduction!="none").
+    
+    Implementation:
+        1. BCE(logits, y) = -y*log(p) - (1-y)*log(1-p), computed via F.binary_cross_entropy_with_logits
+        2. p_t = p*y + (1-p)*(1-y)  [probability of the true class]
+        3. focal_factor = (1 - p_t)^gamma
+        4. If detach_p_for_weight: focal_factor = focal_factor.detach()
+        5. If alpha: alpha_t = alpha*y + (1-alpha)*(1-y); loss = alpha_t * focal_factor * BCE
+           Else: loss = focal_factor * BCE
+    
+    Note:
+        - This function does NOT apply pos_weight (to avoid double-weighting with main BCE).
+        - For CTCVR auxiliary loss in ESMM: use this alongside BCEWithLogits(pos_weight=...).
+    """
+    # Convert targets to float {0, 1}
+    targets = targets.float()
+    
+    # Compute in fp32 for stability if requested (important under AMP)
+    if compute_fp32:
+        logits_w = logits.float()
+        targets_w = targets.float()
+    else:
+        logits_w = logits
+        targets_w = targets
+    
+    # Standard BCE without pos_weight (reduction="none" to get per-sample losses)
+    ce = F.binary_cross_entropy_with_logits(logits_w, targets_w, reduction="none")
+    
+    # Compute probability p = sigmoid(logits)
+    p = torch.sigmoid(logits_w)
+    
+    # Compute p_t: probability assigned to the true class
+    # p_t = p when y=1, p_t = (1-p) when y=0
+    p_t = p * targets_w + (1.0 - p) * (1.0 - targets_w)
+    
+    # Focal factor: (1 - p_t)^gamma
+    # Clamp p_t to [0, 1] for safety (should already be in range, but numerical safety)
+    focal_factor = (1.0 - p_t.clamp(0.0, 1.0)).pow(gamma)
+    
+    # Optionally detach focal_factor to prevent gradient flow through it
+    if detach_p_for_weight:
+        focal_factor = focal_factor.detach()
+    
+    # Apply alpha balancing if provided
+    if alpha is not None:
+        # alpha_t = alpha for positives, (1-alpha) for negatives
+        alpha_t = alpha * targets_w + (1.0 - alpha) * (1.0 - targets_w)
+        loss = alpha_t * focal_factor * ce
+    else:
+        loss = focal_factor * ce
+    
+    # Reduction
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    elif reduction == "none":
+        return loss
+    else:
+        raise ValueError(f"Invalid reduction mode: {reduction}")
+
+
+# ============================================================================
+# Numerically stable helpers for log-domain ESMM
+# ============================================================================
+
+def log1mexp(x: torch.Tensor) -> torch.Tensor:
+    """
+    Computes log(1 - exp(x)) in a numerically stable way for x <= 0.
+    
+    Reference: "Accurately Computing log(1 - exp(-|a|))" by Martin Maechler
+    https://cran.r-project.org/web/packages/Rmpfr/vignettes/log1mexp-note.pdf
+    
+    For x close to 0 (x > -0.6931): use log(-expm1(x)) to avoid catastrophic cancellation.
+    For x <= -0.6931: use log1p(-exp(x)) which is stable in this range.
+    """
+    # Ensure input is <= 0 for valid probability domain
+    out = torch.empty_like(x)
+    # Threshold: log(2) ≈ 0.6931
+    close_to_zero = x > -0.6931
+    out[close_to_zero] = torch.log(-torch.expm1(x[close_to_zero]))
+    out[~close_to_zero] = torch.log1p(-torch.exp(x[~close_to_zero]))
+    return out
+
+
+def bce_from_logp(log_p: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Computes BCE loss given log-probability log_p = log(p) and target y ∈ {0, 1}.
+    
+    BCE = -y * log(p) - (1-y) * log(1-p)
+        = -y * log_p - (1-y) * log1mexp(log_p)
+    
+    This avoids exp(log_p) -> p -> log(p) round-trip and is more stable.
+    """
+    # Clamp log_p to avoid extreme values
+    log_p = torch.clamp(log_p, max=-1e-7)  # ensure log_p < 0 (p < 1)
+    neg_term = log1mexp(log_p)
+    # BCE = -y*log_p - (1-y)*log(1-p)
+    return -y * log_p - (1.0 - y) * neg_term
+
+
 class MultiTaskBCELoss:
     """
     BCE losses for CTR and CVR with click-conditional masking.
-    CTCVR is not directly trained here; only its probability is logged.
+    
+    When use_esmm=True:
+      - esmm_version="v2" (default): Standard ESMM using p_ctcvr = p_ctr * p_cvr with log-domain stability.
+      - esmm_version="legacy": Old behavior (deprecated) treating CVR logit as CTCVR logit directly.
+    
+    CTCVR in standard ESMM is not directly predicted; it's computed as p_ctr * p_cvr.
     """
 
     def __init__(
@@ -20,8 +165,10 @@ class MultiTaskBCELoss:
         w_cvr: float = 1.0,
         eps: float = 1e-6,
         use_esmm: bool = False,
+        esmm_version: str = "v2",  # "v2" (standard) or "legacy"
         lambda_ctr: float = 1.0,
         lambda_ctcvr: float = 1.0,
+        lambda_cvr_aux: float = 0.0,  # CVR aux loss on click=1 subset; 0 to disable
         esmm_eps: float = 1e-8,
         enabled_heads: Any = None,
         pos_weight_dynamic: bool = True,
@@ -29,13 +176,35 @@ class MultiTaskBCELoss:
         static_pos_weight_ctcvr: float | None = None,
         pos_weight_clip_ctr: float | None = None,
         pos_weight_clip_ctcvr: float | None = None,
+        # ===== Aux Focal Configuration (方案1: ESMM 主链路 BCE + CTCVR Aux-Focal) =====
+        aux_focal_enabled: bool = False,
+        aux_focal_warmup_steps: int = 2000,
+        aux_focal_target_head: str = "ctcvr",
+        aux_focal_lambda: float = 0.1,
+        aux_focal_gamma: float = 1.0,
+        aux_focal_use_alpha: bool = False,
+        aux_focal_alpha: float = 0.25,
+        aux_focal_detach_p_for_weight: bool = True,
+        aux_focal_compute_fp32: bool = True,
+        aux_focal_log_components: bool = True,
+        # Global step tracker (will be updated externally by trainer)
+        global_step: int = 0,
     ):
         self.w_ctr = float(w_ctr)
         self.w_cvr = float(w_cvr)
         self.eps = float(eps)
         self.use_esmm = bool(use_esmm)
+        self.esmm_version = str(esmm_version).lower()
+        if self.use_esmm and self.esmm_version == "legacy":
+            warnings.warn(
+                "esmm_version='legacy' is deprecated and may produce incorrect CTCVR semantics. "
+                "Migrate to esmm_version='v2' (standard ESMM: p_ctcvr = p_ctr * p_cvr).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.lambda_ctr = float(lambda_ctr)
         self.lambda_ctcvr = float(lambda_ctcvr)
+        self.lambda_cvr_aux = float(lambda_cvr_aux)
         self.esmm_eps = float(esmm_eps)
         self.pos_weight_dynamic = bool(pos_weight_dynamic)
         self.static_pos_weight_ctr = (
@@ -52,6 +221,21 @@ class MultiTaskBCELoss:
         default_heads = ["ctr", "cvr"]
         enabled_list = enabled_heads or default_heads
         self.enabled_heads = {h.lower() for h in enabled_list}
+        
+        # ===== Aux Focal Configuration =====
+        self.aux_focal_enabled = bool(aux_focal_enabled)
+        self.aux_focal_warmup_steps = int(aux_focal_warmup_steps)
+        self.aux_focal_target_head = str(aux_focal_target_head).lower()
+        self.aux_focal_lambda = float(aux_focal_lambda)
+        self.aux_focal_gamma = float(aux_focal_gamma)
+        self.aux_focal_use_alpha = bool(aux_focal_use_alpha)
+        self.aux_focal_alpha = float(aux_focal_alpha)
+        self.aux_focal_detach_p_for_weight = bool(aux_focal_detach_p_for_weight)
+        self.aux_focal_compute_fp32 = bool(aux_focal_compute_fp32)
+        self.aux_focal_log_components = bool(aux_focal_log_components)
+        
+        # Global step for warmup control (updated externally by trainer)
+        self.global_step = int(global_step)
 
     def compute(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, float]]:
         labels = get_labels(batch)
@@ -69,56 +253,7 @@ class MultiTaskBCELoss:
 
         # ESMM branch: CTR + CTCVR (full exposure, static pos_weight)
         if self.use_esmm:
-            ctr_logit = outputs.get("ctr")
-            ctcvr_logit = outputs.get("ctcvr", outputs.get("cvr"))
-            assert ctr_logit is not None, "ctr logit missing from outputs"
-            assert ctcvr_logit is not None, "ctcvr/cvr logit missing from outputs"
-            assert y_ctr is not None, "y_ctr missing from labels"
-            assert y_ctcvr is not None, "y_ctcvr missing from labels"
-            assert ctr_logit.shape == y_ctr.shape, "ctr logit/label shape mismatch"
-            assert ctcvr_logit.shape == y_ctcvr.shape, "ctcvr logit/label shape mismatch"
-
-            # Static pos_weight only (validated at config level).
-            ctr_pw = self.static_pos_weight_ctr if self.static_pos_weight_ctr is not None else 1.0
-            ctcvr_pw = self.static_pos_weight_ctcvr if self.static_pos_weight_ctcvr is not None else 1.0
-            pos_weight_ctr = torch.tensor(ctr_pw, device=ctr_logit.device, dtype=ctr_logit.dtype)
-            pos_weight_ctcvr = torch.tensor(ctcvr_pw, device=ctcvr_logit.device, dtype=ctcvr_logit.dtype)
-            if self.pos_weight_clip_ctr is not None:
-                pos_weight_ctr = torch.clamp(pos_weight_ctr, max=self.pos_weight_clip_ctr)
-            if self.pos_weight_clip_ctcvr is not None:
-                pos_weight_ctcvr = torch.clamp(pos_weight_ctcvr, max=self.pos_weight_clip_ctcvr)
-
-            loss_ctr = F.binary_cross_entropy_with_logits(ctr_logit, y_ctr, reduction="mean", pos_weight=pos_weight_ctr)
-            loss_ctcvr = F.binary_cross_entropy_with_logits(
-                ctcvr_logit, y_ctcvr, reduction="mean", pos_weight=pos_weight_ctcvr
-            )
-            loss_total = self.lambda_ctr * loss_ctr + self.lambda_ctcvr * loss_ctcvr
-
-            p_ctr = torch.sigmoid(ctr_logit)
-            p_ctcvr = torch.sigmoid(ctcvr_logit)
-            p_cvr = p_ctcvr / (p_ctr + self.esmm_eps)
-            consistency_mask = p_ctr > 1e-3
-            consistency_delta = None
-            if consistency_mask.any():
-                ctcvr_recomposed = p_ctr * p_cvr
-                consistency_delta = float(torch.abs(p_ctcvr[consistency_mask] - ctcvr_recomposed[consistency_mask]).mean().item())
-
-            loss_dict = {
-                "loss_total": float(loss_total.item()),
-                "loss_ctr": float(loss_ctr.item()),
-                "loss_cvr": float(loss_ctcvr.item()),  # kept key name for compatibility
-                "loss_ctcvr": float(loss_ctcvr.item()),
-                "mask_cvr_sum": float(y_ctr.numel()),  # exposures count
-                "pos_weight_ctr": float(pos_weight_ctr.item()),
-                "pos_weight_cvr": float(pos_weight_ctcvr.item()),
-                "pos_weight_ctcvr": float(pos_weight_ctcvr.item()),
-                "pos_weight_mode": "static_esmm",
-                "p_ctr_mean": float(p_ctr.mean().item()),
-                "p_ctcvr_mean": float(p_ctcvr.mean().item()),
-                "p_cvr_mean": float(p_cvr.mean().item()),
-                "consistency_delta": consistency_delta,
-            }
-            return loss_total, loss_dict
+            return self._compute_esmm(outputs, labels, base_device, zero)
 
         loss_ctr = zero()
         loss_cvr = zero()
@@ -214,5 +349,279 @@ class MultiTaskBCELoss:
         }
         return loss_total, loss_dict
 
+    def _compute_esmm(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        labels: Dict[str, torch.Tensor],
+        base_device: torch.device | None,
+        zero: callable,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Standard ESMM (v2) or legacy ESMM computation.
+        
+        Standard ESMM:
+          - p_ctcvr = p_ctr * p_cvr (probability multiplication constraint)
+          - loss_ctcvr = BCE(p_ctcvr, y_ctcvr) computed in log-domain for stability
+          - Optional: loss_cvr_aux = BCE(cvr_logit, y_cvr) on click=1 subset
+        
+        Legacy ESMM (deprecated):
+          - Treats CVR logit as CTCVR logit directly (incorrect semantics)
+        """
+        # Extract required tensors with strict validation
+        ctr_logit = outputs.get("ctr")
+        cvr_logit = outputs.get("cvr")
+        
+        # Strict contract: ESMM v2 requires both ctr_logit and cvr_logit
+        if ctr_logit is None:
+            raise KeyError(
+                "ESMM requires 'ctr' logit in model outputs. "
+                "Ensure your model returns outputs['ctr']."
+            )
+        
+        if self.esmm_version == "v2":
+            # Standard ESMM: must have cvr_logit, NOT ctcvr_logit
+            if cvr_logit is None:
+                raise KeyError(
+                    "Standard ESMM (v2) requires 'cvr' logit (post-click conversion probability) "
+                    "in model outputs. Do NOT provide 'ctcvr' directly; CTCVR is computed as "
+                    "p_ctr * p_cvr. Ensure your model returns outputs['cvr']."
+                )
+        else:
+            # Legacy mode: fallback to ctcvr if cvr not present
+            if cvr_logit is None:
+                cvr_logit = outputs.get("ctcvr")
+            if cvr_logit is None:
+                raise KeyError(
+                    "Legacy ESMM requires 'cvr' or 'ctcvr' logit in model outputs."
+                )
+        
+        y_ctr = labels.get("y_ctr")
+        y_ctcvr = labels.get("y_ctcvr")
+        y_cvr = labels.get("y_cvr")
+        click_mask = labels.get("click_mask")
+        
+        if y_ctr is None:
+            raise KeyError("ESMM requires 'y_ctr' in labels.")
+        if y_ctcvr is None:
+            raise KeyError("ESMM requires 'y_ctcvr' in labels.")
+        
+        # Shape validation
+        if ctr_logit.shape != y_ctr.shape:
+            raise ValueError(
+                f"CTR logit shape {ctr_logit.shape} != y_ctr shape {y_ctr.shape}"
+            )
+        if cvr_logit.shape != y_ctcvr.shape:
+            raise ValueError(
+                f"CVR logit shape {cvr_logit.shape} != y_ctcvr shape {y_ctcvr.shape}"
+            )
 
-__all__ = ["MultiTaskBCELoss"]
+        # Compute in float32 for numerical stability (important for AMP)
+        ctr_logit_f32 = ctr_logit.float()
+        cvr_logit_f32 = cvr_logit.float()
+        y_ctr_f32 = y_ctr.float()
+        y_ctcvr_f32 = y_ctcvr.float()
+
+        # Static pos_weight for CTR loss
+        ctr_pw = self.static_pos_weight_ctr if self.static_pos_weight_ctr is not None else 1.0
+        pos_weight_ctr = torch.tensor(ctr_pw, device=ctr_logit.device, dtype=torch.float32)
+        if self.pos_weight_clip_ctr is not None:
+            pos_weight_ctr = torch.clamp(pos_weight_ctr, max=self.pos_weight_clip_ctr)
+        pos_weight_ctr_val = float(pos_weight_ctr.item())
+
+        # CTR loss (standard BCE with logits)
+        loss_ctr = F.binary_cross_entropy_with_logits(
+            ctr_logit_f32, y_ctr_f32, reduction="mean", pos_weight=pos_weight_ctr
+        )
+
+        if self.esmm_version == "v2":
+            # ============================================================
+            # Standard ESMM: p_ctcvr = p_ctr * p_cvr
+            # Computed in log-domain for numerical stability
+            # ============================================================
+            # log(p_ctr) = logsigmoid(ctr_logit)
+            # log(p_cvr) = logsigmoid(cvr_logit)
+            # log(p_ctcvr) = log(p_ctr) + log(p_cvr)
+            log_p_ctr = F.logsigmoid(ctr_logit_f32)
+            log_p_cvr = F.logsigmoid(cvr_logit_f32)
+            log_p_ctcvr = log_p_ctr + log_p_cvr
+            
+            # CTCVR loss using log-domain BCE (numerically stable)
+            # No pos_weight for CTCVR in standard ESMM to avoid double-weighting
+            # (the multiplication p_ctr * p_cvr already accounts for sparsity)
+            ctcvr_pw = self.static_pos_weight_ctcvr if self.static_pos_weight_ctcvr is not None else 1.0
+            pos_weight_ctcvr_val = float(ctcvr_pw)
+            if self.pos_weight_clip_ctcvr is not None:
+                pos_weight_ctcvr_val = min(pos_weight_ctcvr_val, self.pos_weight_clip_ctcvr)
+            
+            # Weighted BCE from log-probability
+            # BCE = -y * log(p) - (1-y) * log(1-p)
+            # With pos_weight w: BCE = -w*y*log(p) - (1-y)*log(1-p)
+            bce_elements = bce_from_logp(log_p_ctcvr, y_ctcvr_f32)
+            if pos_weight_ctcvr_val != 1.0:
+                # Apply pos_weight: increase weight of positive samples
+                weight = torch.where(
+                    y_ctcvr_f32 > 0.5,
+                    torch.tensor(pos_weight_ctcvr_val, device=bce_elements.device, dtype=torch.float32),
+                    torch.tensor(1.0, device=bce_elements.device, dtype=torch.float32),
+                )
+                bce_elements = bce_elements * weight
+            loss_ctcvr_bce = bce_elements.mean()
+            
+            # ============================================================
+            # 方案1: CTCVR Aux-Focal（配置化 + warmup）
+            # 只在 ESMM v2 且 target_head="ctcvr" 时应用
+            # ============================================================
+            loss_ctcvr_focal_val: Optional[float] = None
+            aux_focal_active = False
+            
+            if (
+                self.aux_focal_enabled
+                and self.aux_focal_target_head == "ctcvr"
+                and self.global_step >= self.aux_focal_warmup_steps
+            ):
+                # Compute CTCVR logits from log_p_ctcvr
+                # logit = log(p / (1-p)) = log(p) - log(1-p)
+                # log(1-p) = log1mexp(log_p) for log_p <= 0
+                log_p_ctcvr_clamped = torch.clamp(log_p_ctcvr, max=-1e-7)  # ensure < 0
+                log_1m_p_ctcvr = log1mexp(log_p_ctcvr_clamped)
+                ctcvr_logit = log_p_ctcvr_clamped - log_1m_p_ctcvr
+                
+                # Apply focal loss
+                focal_alpha = self.aux_focal_alpha if self.aux_focal_use_alpha else None
+                loss_ctcvr_focal = focal_on_logits_aux(
+                    ctcvr_logit,
+                    y_ctcvr_f32,
+                    gamma=self.aux_focal_gamma,
+                    alpha=focal_alpha,
+                    detach_p_for_weight=self.aux_focal_detach_p_for_weight,
+                    compute_fp32=self.aux_focal_compute_fp32,
+                    reduction="mean",
+                )
+                loss_ctcvr_focal_val = float(loss_ctcvr_focal.item())
+                
+                # Combine: L_ctcvr = L_ctcvr_bce + lambda * L_ctcvr_focal
+                loss_ctcvr = loss_ctcvr_bce + self.aux_focal_lambda * loss_ctcvr_focal
+                aux_focal_active = True
+            else:
+                # Warmup phase or disabled: use only BCE
+                loss_ctcvr = loss_ctcvr_bce
+            
+            # Probabilities for metrics (computed from log-domain)
+            p_ctr = torch.sigmoid(ctr_logit_f32)
+            p_cvr = torch.sigmoid(cvr_logit_f32)
+            p_ctcvr = p_ctr * p_cvr  # This equals exp(log_p_ctcvr) but more readable
+            
+        else:
+            # ============================================================
+            # Legacy ESMM: treat CVR logit as CTCVR logit (DEPRECATED)
+            # ============================================================
+            ctcvr_pw = self.static_pos_weight_ctcvr if self.static_pos_weight_ctcvr is not None else 1.0
+            pos_weight_ctcvr = torch.tensor(ctcvr_pw, device=cvr_logit.device, dtype=torch.float32)
+            if self.pos_weight_clip_ctcvr is not None:
+                pos_weight_ctcvr = torch.clamp(pos_weight_ctcvr, max=self.pos_weight_clip_ctcvr)
+            pos_weight_ctcvr_val = float(pos_weight_ctcvr.item())
+            
+            loss_ctcvr = F.binary_cross_entropy_with_logits(
+                cvr_logit_f32, y_ctcvr_f32, reduction="mean", pos_weight=pos_weight_ctcvr
+            )
+            
+            p_ctr = torch.sigmoid(ctr_logit_f32)
+            p_ctcvr = torch.sigmoid(cvr_logit_f32)
+            p_cvr = p_ctcvr / (p_ctr + self.esmm_eps)
+
+        # ============================================================
+        # Optional: CVR auxiliary loss on click=1 subset (ESMM+aux)
+        # This accelerates CVR tower learning by providing direct supervision
+        # ============================================================
+        loss_cvr_aux = zero()
+        loss_cvr_aux_val: float | None = None
+        cvr_aux_mask_sum = 0.0
+        
+        if self.lambda_cvr_aux > 0 and y_cvr is not None:
+            # Use click_mask if available, otherwise use y_ctr as mask
+            if click_mask is not None:
+                aux_mask = click_mask.float()
+            else:
+                aux_mask = y_ctr_f32
+            
+            mask_sum = aux_mask.sum()
+            cvr_aux_mask_sum = float(mask_sum.item())
+            
+            if mask_sum > 0:
+                y_cvr_f32 = y_cvr.float()
+                # BCE on clicked subset
+                loss_vec = F.binary_cross_entropy_with_logits(
+                    cvr_logit_f32, y_cvr_f32, reduction="none"
+                )
+                loss_cvr_aux = (loss_vec * aux_mask).sum() / (mask_sum + self.eps)
+                loss_cvr_aux_val = float(loss_cvr_aux.item())
+
+        # ============================================================
+        # Total loss
+        # ============================================================
+        loss_total = (
+            self.lambda_ctr * loss_ctr 
+            + self.lambda_ctcvr * loss_ctcvr 
+            + self.lambda_cvr_aux * loss_cvr_aux
+        )
+
+        # ============================================================
+        # Metrics for observability
+        # ============================================================
+        p_ctr_mean = float(p_ctr.mean().item())
+        p_cvr_mean = float(p_cvr.mean().item())
+        p_ctcvr_mean = float(p_ctcvr.mean().item())
+        
+        # Positive rates
+        pos_rate_ctr = float(y_ctr_f32.mean().item())
+        pos_rate_ctcvr = float(y_ctcvr_f32.mean().item())
+        pos_rate_cvr: float | None = None
+        if y_cvr is not None:
+            pos_rate_cvr = float(y_cvr.float().mean().item())
+
+        loss_dict = {
+            "loss_total": float(loss_total.item()),
+            "loss_ctr": float(loss_ctr.item()),
+            "loss_cvr": float(loss_ctcvr.item()),  # kept key name for compatibility
+            "loss_ctcvr": float(loss_ctcvr.item()),
+            "loss_cvr_aux": loss_cvr_aux_val,
+            "cvr_aux_mask_sum": cvr_aux_mask_sum,
+            "mask_cvr_sum": float(y_ctr.numel()),  # exposures count
+            "pos_weight_ctr": pos_weight_ctr_val,
+            "pos_weight_cvr": pos_weight_ctcvr_val,  # legacy alias
+            "pos_weight_ctcvr": pos_weight_ctcvr_val,
+            "pos_weight_mode": f"static_esmm_{self.esmm_version}",
+            "p_ctr_mean": p_ctr_mean,
+            "p_cvr_mean": p_cvr_mean,
+            "p_ctcvr_mean": p_ctcvr_mean,
+            "pos_rate_ctr": pos_rate_ctr,
+            "pos_rate_cvr": pos_rate_cvr,
+            "pos_rate_ctcvr": pos_rate_ctcvr,
+            "esmm_version": self.esmm_version,
+            "lambda_ctr": self.lambda_ctr,
+            "lambda_ctcvr": self.lambda_ctcvr,
+            "lambda_cvr_aux": self.lambda_cvr_aux,
+        }
+        
+        # ===== Add aux_focal metrics (方案1) =====
+        if self.aux_focal_log_components and self.esmm_version == "v2":
+            loss_dict["aux_focal_enabled"] = self.aux_focal_enabled
+            loss_dict["aux_focal_warmup_steps"] = self.aux_focal_warmup_steps
+            loss_dict["aux_focal_on"] = aux_focal_active
+            loss_dict["aux_focal_lambda"] = self.aux_focal_lambda
+            loss_dict["aux_focal_gamma"] = self.aux_focal_gamma
+            loss_dict["global_step"] = self.global_step
+            
+            # BCE and Focal components (only when focal is active)
+            if aux_focal_active and loss_ctcvr_focal_val is not None:
+                loss_dict["loss_ctcvr_bce"] = float(loss_ctcvr_bce.item())
+                loss_dict["loss_ctcvr_focal"] = loss_ctcvr_focal_val
+            elif self.aux_focal_enabled:
+                # Warmup phase: only BCE, no focal yet
+                loss_dict["loss_ctcvr_bce"] = float(loss_ctcvr_bce.item()) if self.esmm_version == "v2" else None
+                loss_dict["loss_ctcvr_focal"] = 0.0
+        
+        return loss_total, loss_dict
+
+
+__all__ = ["MultiTaskBCELoss", "log1mexp", "bce_from_logp", "focal_on_logits_aux"]

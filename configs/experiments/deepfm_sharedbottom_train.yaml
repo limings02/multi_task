@@ -63,17 +63,17 @@ runtime:
   # debug_linear_stats: true      # 打印 per-field wide 输出与 bag_len/权重分布
   # debug_fm_stats: true          # 打印 FM 输出分布
   # debug_dataloader_assert: true
-  log_every: 4000
+  log_every: 40
   amp: true
   grad_diag_enabled: true
-  max_train_steps: 20000 # smoke
-  max_valid_steps: 4000  # smoke
+  max_train_steps: 20 # smoke
+  max_valid_steps: 4 # smoke
   grad_clip_norm: 1.0
   seed: 20260127
   resume_path: null
-  auto_eval: true
+  auto_eval: false
   auto_eval_split: "valid"
-  auto_eval_save_preds: true
+  auto_eval_save_preds: false
   auto_eval_ckpt: "best"  # "best" or "last"
   save_last: false
 

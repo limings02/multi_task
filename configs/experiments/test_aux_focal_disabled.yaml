@@ -1,0 +1,117 @@
+experiment:
+  name: "deepfm_mmoe_dual_sparse_aux_focal_disabled"
+
+# ESMM toggle (default off to preserve legacy behaviour)
+use_esmm: true
+esmm:
+  version: "v2"  # "v2" (standard ESMM: p_ctcvr = p_ctr * p_cvr) or "legacy" (deprecated)
+  eps: 1.0e-8
+  lambda_ctr: 1.0
+  lambda_ctcvr: 1.0
+  lambda_cvr_aux: 0.1  # CVR auxiliary loss on click=1 subset; 0 to disable
+
+data:
+  metadata_path: "data/processed/metadata.json"
+  batch_size: 256
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  drop_last: false
+  debug: false
+  seed: 20260127
+  neg_keep_prob_train: 0.4
+
+sampling:
+  negative_sampling: None  # set to "none" when use_esmm=true
+
+embedding:
+  default_embedding_dim: 8
+  embedding_dim_overrides: {}
+  mode: "sum"  # 其实是mean，只是因为iterdataset不允许，后面转为手动实现了
+  sparse_grad: true
+
+model:
+  name: "deepfm_mmoe"
+  mtl: "mmoe"
+  enabled_heads: ["ctr", "cvr"]
+  tasks: ["ctr", "cvr"]
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      ctr: { use_wide: true, use_fm: true }
+      cvr: { use_wide: false, use_fm: false }
+  mmoe:
+    num_experts: 4
+    expert_mlp_dims: [128]
+    gate_type: "linear"
+    gate_hidden_dims: []
+    input: "deep_h"
+    dropout: 0.1
+    log_gates: true
+    add_fm_vec: true
+    add_emb: "mean"
+    part_proj_dim: 128
+    fusion: "concat"
+    adapter_mlp_dims: [128]
+    norm: "none"
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    ctr: {}
+    cvr: {}
+  deep_hidden_dims: [256, 128]
+  deep_dropout: 0.2
+  deep_activation: "relu"
+  deep_use_bn: false
+  fm_enabled: true
+  fm_projection_dim: 16
+  out_dim: 128
+
+optim:
+  type: dual_sparse_dense
+  dense:
+    lr: 0.001
+    weight_decay: 1e-6
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  sparse:
+    enabled: true
+    lr: 0.002
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    allow_fallback_if_empty: false
+
+loss:
+  w_ctr: 1.0
+  w_cvr: 1.0
+  eps: 1.0e-6
+  pos_weight_dynamic: false
+  static_pos_weight:
+    ctr: 24.7
+    ctcvr: 4800
+  pos_weight_clip:
+    ctr: 30
+    ctcvr: 5000
+
+  # ===== Aux Focal DISABLED for backward compatibility test =====
+  aux_focal:
+    enabled: false  # 完全禁用 aux_focal
+
+runtime:
+  device: "cuda"
+  epochs: 1
+  log_every: 100
+  amp: true
+  grad_diag_enabled: false
+  log_health_metrics: false
+  max_train_steps: 200  # Small for smoke test
+  max_valid_steps: 100
+  grad_clip_norm: 1.0
+  seed: 20260127
+  resume_path: null
+  auto_eval: false
+  save_last: false
