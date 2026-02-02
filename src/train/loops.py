@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Callable
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Callable, TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +16,9 @@ from src.utils.health_metrics import (
     compute_prob_stats,
     aggregate_gate_metrics,
 )
+
+if TYPE_CHECKING:
+    from src.train.optim import LRSchedulerBundle
 
 EPS = 1e-12
 _diag_logger = logging.getLogger(__name__)
@@ -39,33 +42,73 @@ def _to_device_features(features: Dict[str, Any], device: torch.device) -> Dict[
     return {"fields": fields, "field_names": features["field_names"]}
 
 
-def _select_shared_params(model, fallback_cap: int = 20) -> List[Tuple[str, torch.nn.Parameter]]:
+def _select_shared_params(model, fallback_cap: int = 50) -> List[Tuple[str, torch.nn.Parameter]]:
     """
-    Prefer shared embedding/backbone params (name contains emb/embedding under backbone).
-    If none found, fall back to the first K backbone params to keep overhead bounded.
+    选择共享参数用于梯度诊断。
+    
+    策略（按优先级）：
+    1. 优先选择 embedding 参数（name 包含 emb/embedding）
+    2. 然后选择 backbone 下的其他参数
+    3. 最后选择其他非 head 参数（如 experts、gates、composer 等）
+    
+    排除规则：
+    - 排除 heads.ctr.* / heads.cvr.* 等 head 专属参数
+    - 排除不需要梯度的参数
+    
+    返回两类参数：
+    - dense 参数：正常的权重矩阵
+    - sparse 参数：embedding 参数（可能有 sparse_grad=True）
+    
+    注意：此函数是 health metrics 的关键依赖，若返回空列表则所有健康指标为 null。
     """
-    preferred: List[Tuple[str, torch.nn.Parameter]] = []
+    # 收集所有候选共享参数（排除 heads）
+    shared_candidates: List[Tuple[str, torch.nn.Parameter]] = []
+    
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         name_low = name.lower()
-        if not name_low.startswith("backbone"):
-            continue
+        
+        # 排除 head 专属参数（heads.ctr, heads.cvr, heads.ctcvr 等）
+        if "heads." in name_low:
+            # 进一步检查是否是特定任务的 head
+            if any(f"heads.{task}" in name_low for task in ["ctr", "cvr", "ctcvr"]):
+                continue
+        
+        shared_candidates.append((name, param))
+    
+    if not shared_candidates:
+        _diag_logger.warning(
+            "_select_shared_params: No shared parameters found! "
+            "This will cause all health metrics to be null."
+        )
+        return []
+    
+    # 按优先级排序：embedding > backbone > 其他 (experts/gates/composer)
+    def priority(item: Tuple[str, torch.nn.Parameter]) -> int:
+        name_low = item[0].lower()
         if "emb" in name_low or "embedding" in name_low:
-            preferred.append((name, param))
-    if preferred:
-        return preferred
-
-    fallback: List[Tuple[str, torch.nn.Parameter]] = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if not name.lower().startswith("backbone"):
-            continue
-        fallback.append((name, param))
-        if len(fallback) >= fallback_cap:
-            break
-    return fallback
+            return 0  # 最高优先级
+        elif name_low.startswith("backbone"):
+            return 1
+        else:
+            return 2  # experts, gates, composer 等
+    
+    shared_candidates.sort(key=priority)
+    
+    # 限制返回数量以控制计算开销
+    result = shared_candidates[:fallback_cap]
+    
+    # 统计 dense 和 sparse 参数数量用于日志
+    dense_count = sum(1 for _, p in result if not getattr(p, 'is_sparse', False))
+    _diag_logger.debug(
+        "_select_shared_params: Selected %d shared params (%d dense), "
+        "total candidates %d, first few: %s",
+        len(result), dense_count, len(shared_candidates),
+        [n for n, _ in result[:5]]
+    )
+    
+    return result
 
 
 def _flatten_grads(params: Sequence[Tuple[str, torch.nn.Parameter]]) -> Tuple[torch.Tensor | None, int, int]:
@@ -124,6 +167,8 @@ def train_one_epoch(
     scaler: Optional[torch_amp.GradScaler] = None,
     amp_device_type: str = "cuda",
     debug_logit_every: Optional[int] = None,
+    lr_scheduler_bundle: Optional["LRSchedulerBundle"] = None,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     """
     Train for one epoch and emit aggregated metrics plus optional gradient diagnostics.
@@ -183,11 +228,49 @@ def train_one_epoch(
     # Legacy: keep shared_params for backward compat logging, but don't use for actual diag
     shared_params: List[Tuple[str, torch.nn.Parameter]] = _select_shared_params(model) if grad_diag_enabled else []
     ctr_raw_count = cvr_raw_count = 0
+
+    # ============================================================
+    # pos_weight_clip schedule configuration (改动 B)
+    # ============================================================
+    pos_weight_clip_schedule_cfg = {}
+    pos_weight_clip_schedule_enabled = False
+    if cfg is not None:
+        loss_cfg = cfg.get("loss", {}) or {}
+        pos_weight_clip_schedule_cfg = loss_cfg.get("pos_weight_clip_schedule", {}) or {}
+        pos_weight_clip_schedule_enabled = bool(pos_weight_clip_schedule_cfg.get("enabled", False))
+    
+    # Store original clip values to restore at end (if schedule modifies them dynamically)
+    original_pos_weight_clip_ctcvr = getattr(loss_fn, "pos_weight_clip_ctcvr", None)
+    original_pos_weight_clip_ctr = getattr(loss_fn, "pos_weight_clip_ctr", None)
+    
+    # Log schedule config at epoch start if enabled
+    if pos_weight_clip_schedule_enabled and step == 0 if 'step' in dir() else True:
+        _diag_logger.info(
+            "[pos_weight_clip_schedule] enabled=true type=%s target=%s milestones=%s values=%s",
+            pos_weight_clip_schedule_cfg.get("type", "piecewise"),
+            pos_weight_clip_schedule_cfg.get("target", "ctcvr"),
+            pos_weight_clip_schedule_cfg.get("milestones"),
+            pos_weight_clip_schedule_cfg.get("values"),
+        )
+
+    # LR scheduler log flag
+    lr_scheduler_enabled = lr_scheduler_bundle is not None and lr_scheduler_bundle.enabled
+    last_logged_lr: Dict[str, float] = {}
     ctr_scaled_count = cvr_scaled_count = 0
 
+    # Performance monitoring
+    data_load_time = 0.0
+    forward_time = 0.0
+    backward_time = 0.0
+    optim_time = 0.0
+
     t_start = time.time()
+    t_batch_start = time.time()
 
     for step, (labels, features, meta) in enumerate(loader):
+        t_data_end = time.time()
+        data_load_time += t_data_end - t_batch_start
+        
         if max_steps is not None and step >= max_steps:
             break
 
@@ -201,17 +284,39 @@ def train_one_epoch(
 
         optimizer_bundle.zero_grad(set_to_none=True)
         # Autocast only on CUDA to avoid CPU precision issues.
+        t_forward_start = time.time()
         with torch_amp.autocast(device_type=amp_device_type, enabled=amp_enabled, dtype=amp_dtype):
             outputs = model(features_dev)
             batch = {"labels": labels, "features": features_dev, "meta": meta}
             loss, loss_dict = loss_fn.compute(outputs, batch)
+            
+            # ============================================================
+            # 改动 C: Add gate regularization loss from MMoE
+            # gate_reg_loss is computed in model.forward() and stored in aux
+            # Only add during training; validation logs stats but doesn't add to loss
+            # ============================================================
+            aux = outputs.get("aux", {}) or {}
+            gate_reg_loss = aux.get("gate_reg_loss")
+            if gate_reg_loss is not None:
+                loss = loss + gate_reg_loss
+                loss_dict["gate_reg_loss"] = float(gate_reg_loss.detach().cpu().item())
+                gate_entropy_mean = aux.get("gate_entropy_mean")
+                gate_lb_kl = aux.get("gate_lb_kl")
+                if gate_entropy_mean is not None:
+                    loss_dict["gate_entropy_mean"] = float(gate_entropy_mean.cpu().item())
+                if gate_lb_kl is not None:
+                    loss_dict["gate_lb_kl"] = float(gate_lb_kl.cpu().item())
+        
+        t_forward_end = time.time()
+        forward_time += t_forward_end - t_forward_start
 
         # Debug-only logit stats (no effect on gradients).
-        current_global_step = global_step + steps + 1
+        # 注意：使用 step（当前批次索引，0-based）计算 current step for debug
+        debug_current_step = global_step + step + 1  # 1-based step for debugging
         should_debug_logits = (
             debug_logit_every is not None
             and debug_logit_every > 0
-            and (current_global_step % debug_logit_every == 0 or current_global_step == 1)
+            and (debug_current_step % debug_logit_every == 0 or debug_current_step == 1)
         )
         if should_debug_logits and hasattr(logger, "info"):
             with torch.no_grad():
@@ -244,7 +349,7 @@ def train_one_epoch(
                 linear_debug = getattr(getattr(model, "backbone", model), "last_linear_debug", None)
                 fm_debug = getattr(getattr(model, "backbone", model), "last_fm_debug", None)
                 log_parts = [
-                    f"[dbg_logit] step={current_global_step}",
+                    f"[dbg_logit] step={debug_current_step}",
                     f"ctr_total={stats_total}",
                     f"wide={stats_wide}",
                     f"fm={stats_fm}",
@@ -288,18 +393,86 @@ def train_one_epoch(
             if log_loss_debug and hasattr(logger, "debug"):
                 logger.debug("skip backward/step at step=%d because mask_cvr_sum==0 in CVR-only batch", step + 1)
         else:
+            t_backward_start = time.time()
             if amp_enabled and scaler is not None and scaler.is_enabled():
                 scaler.scale(loss).backward()
                 if grad_clip_norm is not None:
                     # unscale before clipping, otherwise clipping would operate on scaled grads.
                     optimizer_bundle.unscale_(scaler)
                     clip_grad_norm_(optimizer_bundle.dense_params, grad_clip_norm)
+                t_backward_end = time.time()
+                backward_time += t_backward_end - t_backward_start
+                t_optim_start = time.time()
                 optimizer_bundle.step(scaler)
+                t_optim_end = time.time()
+                optim_time += t_optim_end - t_optim_start
             else:
                 loss.backward()
                 if grad_clip_norm is not None:
                     clip_grad_norm_(optimizer_bundle.dense_params, grad_clip_norm)
+                t_backward_end = time.time()
+                backward_time += t_backward_end - t_backward_start
+                t_optim_start = time.time()
                 optimizer_bundle.step()
+                t_optim_end = time.time()
+                optim_time += t_optim_end - t_optim_start
+            
+            # ============================================================
+            # LR Scheduler step (改动 A: step-based scheduling)
+            # ============================================================
+            if lr_scheduler_enabled:
+                lr_scheduler_bundle.step()
+                last_logged_lr = lr_scheduler_bundle.get_last_lr()
+
+        # ============================================================
+        # pos_weight_clip schedule update (改动 B)
+        # Update clip values based on current_global_step
+        # ============================================================
+        if pos_weight_clip_schedule_enabled:
+            from src.loss.bce import _effective_pos_weight
+            
+            sch_type = str(pos_weight_clip_schedule_cfg.get("type", "piecewise")).lower()
+            sch_target = str(pos_weight_clip_schedule_cfg.get("target", "ctcvr")).lower()
+            
+            def _compute_scheduled_clip(step: int) -> float:
+                if sch_type == "piecewise":
+                    milestones = pos_weight_clip_schedule_cfg.get("milestones", [0])
+                    values = pos_weight_clip_schedule_cfg.get("values", [400])
+                    # Find the current value based on step
+                    current_val = values[0] if values else 400.0
+                    for i, milestone in enumerate(milestones):
+                        if step >= milestone and i < len(values):
+                            current_val = values[i]
+                    return float(current_val)
+                elif sch_type == "linear":
+                    start_step = int(pos_weight_clip_schedule_cfg.get("start_step", 0))
+                    end_step = int(pos_weight_clip_schedule_cfg.get("end_step", 40000))
+                    start_value = float(pos_weight_clip_schedule_cfg.get("start_value", 400))
+                    end_value = float(pos_weight_clip_schedule_cfg.get("end_value", 100))
+                    if step <= start_step:
+                        return start_value
+                    elif step >= end_step:
+                        return end_value
+                    else:
+                        progress = (step - start_step) / max(end_step - start_step, 1)
+                        return start_value + (end_value - start_value) * progress
+                else:
+                    return 400.0  # fallback
+            
+            current_clip = _compute_scheduled_clip(current_global_step)
+            
+            # Apply to target(s)
+            if sch_target in ("ctcvr", "both"):
+                loss_fn.pos_weight_clip_ctcvr = current_clip
+            if sch_target in ("ctr", "both"):
+                loss_fn.pos_weight_clip_ctr = current_clip
+            
+            # Compute effective pos_weight for logging
+            raw_ctcvr = getattr(loss_fn, "static_pos_weight_ctcvr", None) or 1.0
+            effective_ctcvr, _ = _effective_pos_weight(raw_ctcvr, current_clip)
+            loss_dict["pos_weight_clip_ctcvr_scheduled"] = current_clip
+            loss_dict["effective_pos_weight_ctcvr"] = effective_ctcvr
+            loss_dict["pos_weight_ctcvr_raw"] = raw_ctcvr
 
         # aggregate stats
         B = int(labels["y_ctr"].shape[0])
@@ -342,9 +515,13 @@ def train_one_epoch(
                 cvr_aux_count += 1
 
         steps += 1
+        
+        # Reset batch timer for next iteration
+        t_batch_start = time.time()
 
         # ============================================================
         # New Dynamic Gradient Diagnostics (supports dense + sparse)
+        # current_global_step 来自 line 245: global_step + step
         # ============================================================
         should_sample_grad = (
             grad_diag_enabled
@@ -354,6 +531,10 @@ def train_one_epoch(
             and (current_global_step % diag_every == 0)
         )
         if should_sample_grad:
+            _diag_logger.debug(
+                "grad_diag: Starting diagnostics at global_step=%d (diag_every=%d)",
+                current_global_step, diag_every
+            )
             try:
                 # Zero gradients before diagnostics
                 optimizer_bundle.zero_grad(set_to_none=True)
@@ -435,16 +616,35 @@ def train_one_epoch(
                         conflict_hits += 1
                 
                 grad_samples += 1
+                _diag_logger.debug(
+                    "grad_diag: Sample %d completed. dense_count=%d, sparse_count=%d, "
+                    "cos_dense=%s, cos_sparse=%s, cos_all=%s",
+                    grad_samples, shared_dense_count_last, shared_sparse_count_last,
+                    cos_dense, cos_sparse, cos_all
+                )
                 
                 # Zero gradients after diagnostics
                 optimizer_bundle.zero_grad(set_to_none=True)
                 
             except Exception as e:
-                _diag_logger.warning("grad_diag: error during computation: %s", e)
+                _diag_logger.warning(
+                    "grad_diag: error during computation at global_step=%d: %s",
+                    current_global_step, e, exc_info=True
+                )
                 optimizer_bundle.zero_grad(set_to_none=True)
 
         if (step + 1) % log_every == 0:
             elapsed = time.time() - t_start
+            steps_per_sec = (step + 1) / elapsed if elapsed > 0 else 0.0
+            samples_per_sec = n_rows / elapsed if elapsed > 0 else 0.0
+            
+            # Calculate timing percentages
+            total_time = data_load_time + forward_time + backward_time + optim_time
+            data_pct = 100 * data_load_time / total_time if total_time > 0 else 0
+            forward_pct = 100 * forward_time / total_time if total_time > 0 else 0
+            backward_pct = 100 * backward_time / total_time if total_time > 0 else 0
+            optim_pct = 100 * optim_time / total_time if total_time > 0 else 0
+            
             log_parts = [
                 f"[train] epoch={epoch} step={step+1} global_step={current_global_step}",
                 f"loss_total={loss_dict['loss_total']:.4f}",
@@ -471,8 +671,54 @@ def train_one_epoch(
                 ctr_pw = loss_dict.get("pos_weight_ctr")
                 if ctr_pw is not None:
                     log_parts.append(f"ctr_pos_w={ctr_pw:.3f}")
+            
+            # ============================================================
+            # 改动 A: Log current learning rate
+            # ============================================================
+            if lr_scheduler_enabled and last_logged_lr:
+                lr_dense = last_logged_lr.get("lr_dense")
+                lr_sparse = last_logged_lr.get("lr_sparse")
+                if lr_dense is not None:
+                    log_parts.append(f"dense_lr={lr_dense:.6g}")
+                if lr_sparse is not None:
+                    log_parts.append(f"sparse_lr={lr_sparse:.6g}")
+            
+            # ============================================================
+            # 改动 B: Log pos_weight_clip schedule info
+            # ============================================================
+            if pos_weight_clip_schedule_enabled:
+                ctcvr_clip = loss_dict.get("pos_weight_clip_ctcvr_scheduled")
+                effective_ctcvr = loss_dict.get("effective_pos_weight_ctcvr")
+                raw_ctcvr = loss_dict.get("pos_weight_ctcvr_raw")
+                if ctcvr_clip is not None:
+                    log_parts.append(f"ctcvr_clip={ctcvr_clip:.1f}")
+                if effective_ctcvr is not None:
+                    log_parts.append(f"effective_pos_w_ctcvr={effective_ctcvr:.2f}")
+                if raw_ctcvr is not None:
+                    log_parts.append(f"raw_pos_w_ctcvr={raw_ctcvr:.2f}")
+            
+            # ============================================================
+            # 改动 C: Log gate regularization metrics
+            # ============================================================
+            gate_reg_loss_val = loss_dict.get("gate_reg_loss")
+            gate_entropy_mean = loss_dict.get("gate_entropy_mean")
+            gate_lb_kl = loss_dict.get("gate_lb_kl")
+            if gate_reg_loss_val is not None:
+                log_parts.append(f"gate_reg_loss={gate_reg_loss_val:.6f}")
+            if gate_entropy_mean is not None:
+                log_parts.append(f"gate_entropy_mean={gate_entropy_mean:.4f}")
+            if gate_lb_kl is not None:
+                log_parts.append(f"gate_lb_kl={gate_lb_kl:.6f}")
+            
+            # Add performance metrics
+            log_parts.append(f"samples={n_rows} steps/s={steps_per_sec:.2f} samples/s={samples_per_sec:.1f}")
             log_parts.append(f"time={elapsed:.2f}s")
+            log_parts.append(f"timing(data={data_load_time:.1f}s[{data_pct:.0f}%] fwd={forward_time:.1f}s[{forward_pct:.0f}%] bwd={backward_time:.1f}s[{backward_pct:.0f}%] opt={optim_time:.1f}s[{optim_pct:.0f}%])")
+            
             logger.info(" ".join(log_parts))
+            
+            # Reset timing counters after logging
+            data_load_time = forward_time = backward_time = optim_time = 0.0
 
         if eval_every_steps and validate_fn and (current_global_step % eval_every_steps == 0):
             # Mid-epoch validation at the same cadence as training logs.
@@ -564,6 +810,32 @@ def train_one_epoch(
             "esmm_version": esmm_version,
         }
 
+    # ============================================================
+    # 改动 A: Add lr_dense/lr_sparse to metrics
+    # ============================================================
+    lr_metrics = {}
+    if lr_scheduler_enabled and last_logged_lr:
+        lr_metrics["lr_dense"] = last_logged_lr.get("lr_dense")
+        lr_metrics["lr_sparse"] = last_logged_lr.get("lr_sparse")
+    
+    # ============================================================
+    # 改动 B: Add pos_weight_clip schedule info to metrics
+    # ============================================================
+    clip_schedule_metrics = {}
+    if pos_weight_clip_schedule_enabled:
+        clip_schedule_metrics["pos_weight_clip_ctcvr"] = loss_dict.get("pos_weight_clip_ctcvr_scheduled")
+        clip_schedule_metrics["effective_pos_weight_ctcvr"] = loss_dict.get("effective_pos_weight_ctcvr")
+        clip_schedule_metrics["pos_weight_ctcvr_raw"] = loss_dict.get("pos_weight_ctcvr_raw")
+    
+    # ============================================================
+    # 改动 C: Add gate stabilization metrics
+    # ============================================================
+    gate_metrics = {}
+    if loss_dict.get("gate_reg_loss") is not None:
+        gate_metrics["gate_reg_loss"] = loss_dict.get("gate_reg_loss")
+        gate_metrics["gate_entropy_mean"] = loss_dict.get("gate_entropy_mean")
+        gate_metrics["gate_lb_kl"] = loss_dict.get("gate_lb_kl")
+
     return {
         "loss_total": tot_loss / steps,
         "loss_ctr": mean_ctr if has_ctr else 0.0,
@@ -581,6 +853,9 @@ def train_one_epoch(
         "steps_per_sec": steps / dur if dur > 0 else 0.0,
         **grad_metrics,
         **esmm_metrics,
+        **lr_metrics,
+        **clip_schedule_metrics,
+        **gate_metrics,
     }
 
 
@@ -794,15 +1069,13 @@ def validate(
                     mask=mask_arr > 0.5,
                 )
                 auc_cvr = cvr_metrics.get("auc")
-            if auc_cvr is not None and not use_esmm:  # esmm keeps cvr as optional monitor, not part of primary auc
+            if auc_cvr is not None:
                 auc_vals.append(auc_cvr)
         if use_esmm and y_ctcvr_list and ctcvr_logit_list:
             ctcvr_metrics = compute_binary_metrics(
                 torch.cat(y_ctcvr_list).numpy(), torch.cat(ctcvr_logit_list).numpy()
             )
             auc_ctcvr = ctcvr_metrics.get("auc")
-            if auc_ctcvr is not None:
-                auc_vals.append(auc_ctcvr)
         if auc_vals:
             auc_primary = float(sum(auc_vals) / len(auc_vals))
 

@@ -8,14 +8,16 @@ esmm:
   eps: 1.0e-8
   lambda_ctr: 1.0
   lambda_ctcvr: 1.0
-  lambda_cvr_aux: 0.2  # CVR auxiliary loss on click=1 subset; 0 to disable
+  lambda_cvr_aux: 0.1  # CVR auxiliary loss on click=1 subset; 0 to disable
 
 data:
   metadata_path: "data/processed/metadata.json"
-  batch_size: 256
-  num_workers: 0
-  pin_memory: false
-  persistent_workers: false
+  batch_size: 512
+  num_workers: 6
+  num_workers_valid: 2  # Use fewer workers for validation
+  prefetch_factor: 6
+  pin_memory: true
+  persistent_workers: true
   drop_last: false
   debug: false
   seed: 20260127
@@ -47,15 +49,15 @@ model:
     gate_type: "linear"
     gate_hidden_dims: []
     input: "deep_h"
-    dropout: 0.1
+    dropout: 0.2
     log_gates: true  # Enable gate weight logging for health metrics
     # ===== 新增字段 =====
-    add_fm_vec: true       # 是否加入 fm_vec（FM 二阶向量）
+    add_fm_vec: false       # 是否加入 fm_vec（FM 二阶向量）
     add_emb: "mean"         # embedding 聚合方式: none|sum|mean|concat
     part_proj_dim: 128      # 每个 part 投影到的统一维度；null 表示保留原维度
     fusion: "concat"        # 融合方式: concat|sum
     adapter_mlp_dims: [128]    # 融合后可选 MLP 层维度
-    norm: "none"            # 各 part 投影后的归一化: none|layernorm
+    norm: "layernorm"            # 各 part 投影后的归一化: none|layernorm
   heads:
     default:
       mlp_dims: [128]
@@ -75,20 +77,20 @@ model:
 optim:
   type: dual_sparse_dense
   dense:
-    lr: 0.001
-    weight_decay: 1e-6
+    lr: 0.0006
+    weight_decay: 1e-5
     betas: [0.9, 0.999]
     eps: 1.0e-8
   sparse:
     enabled: true
-    lr: 0.002
+    lr: 0.0005
     betas: [0.9, 0.999]
     eps: 1.0e-8
     allow_fallback_if_empty: false
 
 loss:
   w_ctr: 1.0
-  w_cvr: 1.0
+  w_cvr: 0.5
   eps: 1.0e-6
   pos_weight_dynamic: false
   static_pos_weight:
@@ -96,7 +98,7 @@ loss:
     ctcvr: 4800           #4800
   pos_weight_clip:
     ctr: 30
-    ctcvr: 5000
+    ctcvr: 300
 
   # ===== 方案1: ESMM 主链路 BCE + CTCVR Aux-Focal（配置化 + warmup）=====
   # 说明：
@@ -110,10 +112,10 @@ loss:
   #   - gamma: 1.0, 2.0
   #   - warmup_steps: 1000, 2000
   aux_focal:
-    enabled: true              # 开关：true 启用，false 禁用（默认禁用以保持向后兼容）
-    warmup_steps: 5000         # warmup 步数：前 N step 不启用 aux focal
+    enabled: false              # 开关：true 启用，false 禁用（默认禁用以保持向后兼容）
+    warmup_steps: 6000         # warmup 步数：前 N step 不启用 aux focal
     target_head: "ctcvr"       # 目标 head（固定为 ctcvr，不要改为 ctr）
-    lambda: 0.1                # focal 辅助项系数（推荐 sweep: 0.05/0.1/0.2）
+    lambda: 0.05                # focal 辅助项系数（推荐 sweep: 0.05/0.1/0.2）
     gamma: 1.0                 # focal gamma（推荐 sweep: 1.0/2.0；gamma 越大，easy samples 权重越低）
     use_alpha: false           # 是否使用 alpha 平衡（避免与 pos_weight 叠加）
     alpha: 0.25                # alpha 值（仅 use_alpha=true 时生效）
@@ -124,15 +126,15 @@ loss:
 runtime:
   device: "cuda"
   epochs: 1
-  log_every: 40
+  log_every: 5000
   amp: true
   grad_diag_enabled: true  # Enable new dynamic gradient diagnostics
-  grad_diag_every: 4000    # Run at same frequency as logging (null = use log_every)
+  grad_diag_every: 20000    # Run at same frequency as logging (null = use log_every)
   grad_diag_min_tasks: 2   # Minimum tasks for shared param identification
   log_health_metrics: true  # Enable health metrics logging
-  max_train_steps: 40
-  max_valid_steps: 8
-  grad_clip_norm: 1.0
+  max_train_steps: 40000
+  max_valid_steps: 20000
+  grad_clip_norm: 3.0
   seed: 20260127
   resume_path: null
   auto_eval: true

@@ -55,21 +55,43 @@ def _ensure_list(obj: Any) -> List[Any]:
         return list(obj)
     if torch.is_tensor(obj):
         return obj.tolist()
+    # Handle numpy arrays
+    if hasattr(obj, '__array__'):
+        import numpy as np
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
     return [obj]
 
 
 def _check_indices(indices: List[int], base: str, row_idx: int, meta: Dict[str, Any], debug: bool) -> None:
+    import numpy as np
     for idx in indices:
         if idx is None:
             raise ValueError(f"{base}: idx is None at row {row_idx}")
-        if idx < 0:
-            raise ValueError(f"{base}: negative idx {idx} at row {row_idx}")
+        # Handle both scalar and array elements
+        if hasattr(idx, '__len__') and not isinstance(idx, str):
+            # idx is array/list, check all elements
+            idx_arr = np.atleast_1d(idx)
+            if (idx_arr < 0).any():
+                neg_vals = idx_arr[idx_arr < 0].tolist()
+                raise ValueError(f"{base}: negative idx {neg_vals} at row {row_idx}")
+        else:
+            # idx is scalar
+            if idx < 0:
+                raise ValueError(f"{base}: negative idx {idx} at row {row_idx}")
     if debug:
         upper = meta.get("num_embeddings") or meta.get("vocab_num_embeddings") or meta.get("hash_bucket")
         offset = meta.get("special_base_offset") or meta.get("base_offset") or 0
         if upper is not None:
             limit = offset + int(upper)
-            bad = [x for x in indices if x >= limit]
+            # Flatten indices to handle nested arrays
+            flat_indices = []
+            for idx in indices:
+                if hasattr(idx, '__iter__') and not isinstance(idx, str):
+                    flat_indices.extend(list(np.atleast_1d(idx)))
+                else:
+                    flat_indices.append(idx)
+            bad = [x for x in flat_indices if x >= limit]
             if bad:
                 raise ValueError(f"{base}: {len(bad)} indices exceed num_embeddings={limit}, sample row {row_idx}, first5={bad[:5]}")
 
@@ -109,6 +131,23 @@ def collate_fn_embeddingbag(
             break
 
     # 2) labels/meta with ESMM-friendly guards
+    # Optimized: vectorize funnel consistency check
+    import numpy as np
+    
+    y_ctr_raw = np.array([float(row.get("y_ctr", 0.0)) for row in batch], dtype=np.float32)
+    y_cvr_raw = np.array([float(row.get("y_cvr", 0.0)) if row.get("y_cvr") is not None else 0.0 
+                          for row in batch], dtype=np.float32)
+    
+    # Vectorized funnel consistency filter
+    valid_mask = ~((y_ctr_raw <= 0.0) & (y_cvr_raw > 0.0))
+    
+    if not np.any(valid_mask):
+        raise ValueError("Batch empty after filtering funnel-inconsistent samples.")
+    
+    # Apply corrections vectorized
+    y_cvr_corrected = np.where(y_ctr_raw <= 0.0, 0.0, y_cvr_raw)
+    
+    # Build filtered rows
     filtered_rows: List[Tuple[Dict, float, float]] = []
     y_ctr_list: List[float] = []
     y_cvr_list: List[float] = []
@@ -117,18 +156,11 @@ def collate_fn_embeddingbag(
     row_id_list: List[int] = []
     entity_id_list: List[Any] = []
 
-    for row in batch:
-        y_ctr = float(row.get("y_ctr", 0.0))
-        raw_y_cvr = row.get("y_cvr", 0.0)
-        try:
-            y_cvr = float(raw_y_cvr)
-        except Exception:
-            y_cvr = 0.0
-
-        if y_ctr <= 0.0 and y_cvr > 0.0:
-            continue  # drop funnel-inconsistent samples entirely
-        if y_ctr <= 0.0:
-            y_cvr = 0.0
+    for idx, (row, is_valid) in enumerate(zip(batch, valid_mask)):
+        if not is_valid:
+            continue
+        y_ctr = float(y_ctr_raw[idx])
+        y_cvr = float(y_cvr_corrected[idx])
         filtered_rows.append((row, y_ctr, y_cvr))
 
     if not filtered_rows:
@@ -326,6 +358,7 @@ def make_dataloader(
     subset_ratio: float | None = None,
     subset_max_samples: int | None = None,
     subset_seed: int | None = None,
+    prefetch_factor: int | None = None,
 ) -> DataLoader:
     """
     Build a DataLoader that yields (labels, features, meta) tuples
@@ -361,6 +394,9 @@ def make_dataloader(
     worker_init = partial(_worker_init_with_seed, base_seed=base_seed) if seed is not None else None
     collate = partial(_collate_embeddingbag, feature_meta=fm, debug=debug)
 
+    # Determine prefetch_factor: use provided value, or default to 2 if num_workers > 0
+    effective_prefetch = prefetch_factor if prefetch_factor is not None else (2 if num_workers > 0 else None)
+    
     dl = DataLoader(
         ds,
         batch_size=batch_size,
@@ -371,13 +407,15 @@ def make_dataloader(
         persistent_workers=bool(persistent_workers and num_workers > 0),
         collate_fn=collate,
         worker_init_fn=worker_init,
+        prefetch_factor=effective_prefetch,
     )
     if num_workers > 0:
         logging.getLogger(__name__).info(
-            "DataLoader spawn config: num_workers=%d persistent_workers=%s pin_memory=%s collate_fn=%s.%s",
+            "DataLoader spawn config: num_workers=%d persistent_workers=%s pin_memory=%s prefetch_factor=%s collate_fn=%s.%s",
             num_workers,
             bool(persistent_workers and num_workers > 0),
             pin_memory,
+            effective_prefetch,
             collate.func.__module__ if isinstance(collate, partial) else type(collate).__module__,
             collate.func.__name__ if isinstance(collate, partial) else getattr(collate, "__name__", type(collate).__name__),
         )

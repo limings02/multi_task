@@ -13,7 +13,7 @@ esmm:
 data:
   metadata_path: "data/processed/metadata.json"
   batch_size: 64
-  num_workers: 0
+  num_workers: 4
   pin_memory: false
   persistent_workers: false
   drop_last: false
@@ -86,19 +86,21 @@ loss:
   pos_weight_dynamic: false
   static_pos_weight:
     ctr: 24.7
-    ctcvr: 4800
+    ctcvr: 4800       # raw 值 = 4800
   pos_weight_clip:
-    ctr: 1
-    ctcvr: 1
+    ctr: 30           # ctr: 24.7 < 30, 不裁剪
+    ctcvr: 400        # ctcvr: 4800 > 400, 裁剪到 400
 
 runtime:
   device: "cuda"
   epochs: 1
   log_every: 10  # Log frequently for smoke test
   amp: true
-  grad_diag_enabled: false
+  grad_diag_enabled: true   # 启用梯度诊断以测试 health metrics
+  grad_diag_every: 2       # 每 10 步采样一次
+  grad_diag_min_tasks: 2
   log_health_metrics: true  # Enable health metrics logging
-  max_train_steps: 20
+  max_train_steps: 30       # 短训练
   max_valid_steps: 10
   grad_clip_norm: 1.0
   seed: 20260127

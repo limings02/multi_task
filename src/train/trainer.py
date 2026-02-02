@@ -19,7 +19,7 @@ from src.loss.bce import MultiTaskBCELoss
 from src.models.build import build_model
 from src.eval.run_eval import run_eval
 from src.train.loops import train_one_epoch, validate
-from src.train.optim import build_optimizer_bundle
+from src.train.optim import build_optimizer_bundle, build_lr_scheduler_bundle, LRSchedulerBundle
 from src.utils.feature_meta import build_model_feature_meta
 from src.utils.metrics_schema import apply_esmm_schema
 
@@ -166,11 +166,16 @@ class Trainer:
             feature_meta=self.feature_meta,
             debug=bool(cfg["data"].get("debug", False) or self.debug_dataloader_assert),
             neg_keep_prob_train=self.neg_keep_prob_train,
+            prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
         )
+        # Use separate num_workers for validation to avoid memory issues
+        # Default to half of train workers or max 2 to prevent OOM with persistent_workers
+        train_workers = int(cfg["data"].get("num_workers", 0))
+        valid_workers = int(cfg["data"].get("num_workers_valid", max(1, train_workers // 2)))
         self.valid_loader = make_dataloader(
             split="valid",
             batch_size=int(cfg["data"]["batch_size"]),
-            num_workers=int(cfg["data"].get("num_workers", 0)),
+            num_workers=valid_workers,
             shuffle=False,
             drop_last=False,
             pin_memory=bool(cfg["data"].get("pin_memory", True)),
@@ -178,6 +183,7 @@ class Trainer:
             seed=cfg["data"].get("seed"),
             feature_meta=self.feature_meta,
             debug=bool(cfg["data"].get("debug", False) or self.debug_dataloader_assert),
+            prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
         )
 
         self.model = build_model(cfg).to(self.device)
@@ -190,6 +196,19 @@ class Trainer:
 
         opt_cfg = cfg.get("optim", {})
         self.optim_bundle = build_optimizer_bundle(cfg, self.model, scaler=self.scaler)
+
+        # ===== Build LR Scheduler (warmup + decay, step-based) =====
+        runtime_cfg = cfg.get("runtime", {})
+        epochs = int(runtime_cfg.get("epochs", 1))
+        max_train_steps = runtime_cfg.get("max_train_steps")
+        self.lr_scheduler_bundle = build_lr_scheduler_bundle(
+            cfg,
+            self.optim_bundle,
+            train_loader_len=len(self.train_loader),
+            epochs=epochs,
+            max_steps=max_train_steps,
+            logger_obj=self.logger,
+        )
 
         # ===== Load aux_focal configuration (方案1: ESMM 主链路 BCE + CTCVR Aux-Focal) =====
         aux_focal_cfg = loss_cfg.get("aux_focal", {})
@@ -243,6 +262,27 @@ class Trainer:
                 esmm_cfg.get("lambda_cvr_aux", 0.0),
             )
             
+            # ====================================================================
+            # 打印 pos_weight 配置: raw (原始配置) / clip (裁剪上限) / effective (实际使用)
+            # 此日志用于验证 pos_weight_clip 是否真正生效
+            # ====================================================================
+            from src.loss.bce import _effective_pos_weight
+            ctr_raw = float(static_pos_weight_cfg.get("ctr", 1.0))
+            ctcvr_raw = float(static_pos_weight_cfg.get("ctcvr", 1.0))
+            ctr_clip = float(pos_weight_clip_cfg.get("ctr")) if "ctr" in pos_weight_clip_cfg else None
+            ctcvr_clip = float(pos_weight_clip_cfg.get("ctcvr")) if "ctcvr" in pos_weight_clip_cfg else None
+            ctr_effective, ctr_clipped = _effective_pos_weight(ctr_raw, ctr_clip)
+            ctcvr_effective, ctcvr_clipped = _effective_pos_weight(ctcvr_raw, ctcvr_clip)
+            
+            self.logger.info(
+                "[pos_weight] CTR: raw=%.2f clip=%s effective=%.2f clipped=%s",
+                ctr_raw, ctr_clip, ctr_effective, ctr_clipped
+            )
+            self.logger.info(
+                "[pos_weight] CTCVR: raw=%.2f clip=%s effective=%.2f clipped=%s",
+                ctcvr_raw, ctcvr_clip, ctcvr_effective, ctcvr_clipped
+            )
+            
             # Log Aux Focal configuration if enabled
             if aux_focal_cfg.get("enabled", False):
                 self.logger.info(
@@ -268,6 +308,11 @@ class Trainer:
             info = load_checkpoint(resume_path, self.model, self.optim_bundle, map_location=self.device, strict=False)
             self.best_metric = info.get("best_metric", self.best_metric)
             self.global_step = info.get("step", 0) or 0
+            # Restore lr_scheduler state if present
+            extra = info.get("extra", {}) or {}
+            if "lr_scheduler" in extra and self.lr_scheduler_bundle.enabled:
+                self.lr_scheduler_bundle.load_state_dict(extra.get("lr_scheduler"))
+                self.logger.info("Restored lr_scheduler state from checkpoint")
             self.logger.info(f"Resumed from {resume_path}, step={self.global_step}, best_metric={self.best_metric}")
 
     def _write_metrics(self, metrics: Dict[str, Any]) -> None:
@@ -317,6 +362,9 @@ class Trainer:
                 full_auc = val_metrics.get("auc_primary")
                 if full_auc is not None and full_auc > self.best_metric:
                     self.best_metric = full_auc
+                    eval_extra = {"epoch": ep, "kind": "full"}
+                    if self.lr_scheduler_bundle.enabled:
+                        eval_extra["lr_scheduler"] = self.lr_scheduler_bundle.state_dict()
                     save_checkpoint(
                         self.run_dir / "ckpt_best.pt",
                         self.model,
@@ -324,7 +372,7 @@ class Trainer:
                         cfg=self.cfg,
                         step=g_step,
                         best_metric=self.best_metric,
-                        extra={"epoch": ep, "kind": "full"},
+                        extra=eval_extra,
                     )
                     self.logger.info(f"New best at step {g_step}: auc={self.best_metric:.4f}")
 
@@ -355,6 +403,8 @@ class Trainer:
                 scaler=self.scaler,
                 amp_device_type=self.amp_device_type,
                 debug_logit_every=self.debug_logit_every,
+                lr_scheduler_bundle=self.lr_scheduler_bundle,
+                cfg=self.cfg,
             )
             self.global_step += train_metrics.get("steps", 0)
             train_record = {"epoch": epoch, "split": "train", **train_metrics}
@@ -378,6 +428,11 @@ class Trainer:
             self._write_metrics(valid_record)
 
             # checkpointing
+            # Prepare extra dict with lr_scheduler state
+            ckpt_extra = {"epoch": epoch}
+            if self.lr_scheduler_bundle.enabled:
+                ckpt_extra["lr_scheduler"] = self.lr_scheduler_bundle.state_dict()
+            
             if save_last:
                 save_checkpoint(
                     self.run_dir / "ckpt_last.pt",
@@ -386,7 +441,7 @@ class Trainer:
                     cfg=self.cfg,
                     step=self.global_step,
                     best_metric=self.best_metric,
-                    extra={"epoch": epoch},
+                    extra=ckpt_extra,
                 )
             if valid_metrics:
                 full_auc = valid_metrics.get("auc_primary")
@@ -399,7 +454,7 @@ class Trainer:
                         cfg=self.cfg,
                         step=self.global_step,
                         best_metric=self.best_metric,
-                        extra={"epoch": epoch, "kind": "full"},
+                        extra={**ckpt_extra, "kind": "full"},
                     )
                     self.logger.info(f"New best at epoch {epoch}: auc={self.best_metric:.4f}")
 

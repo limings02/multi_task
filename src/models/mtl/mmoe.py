@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Dict, List, Optional, Set
 
 import torch
@@ -16,12 +17,27 @@ logger = logging.getLogger(__name__)
 class _Gate(nn.Module):
     """
     Per-task gate that outputs a softmax over experts.
+    
+    Supports optional stabilization features (改动 C):
+    - temperature: >1 makes softmax smoother, <1 makes it sharper
+    - noise_std: Gaussian noise added to logits (training only)
     """
 
-    def __init__(self, in_dim: int, num_experts: int, gate_type: str = "linear", hidden_dims: Optional[List[int]] = None):
+    def __init__(
+        self, 
+        in_dim: int, 
+        num_experts: int, 
+        gate_type: str = "linear", 
+        hidden_dims: Optional[List[int]] = None,
+        temperature: float = 1.0,
+        noise_std: float = 0.0,
+    ):
         super().__init__()
         gate_type = gate_type.lower()
         self.num_experts = num_experts
+        self.temperature = temperature
+        self.noise_std = noise_std
+        
         if gate_type == "linear":
             self.net = nn.Linear(in_dim, num_experts)
         elif gate_type == "mlp":
@@ -33,9 +49,34 @@ class _Gate(nn.Module):
         else:
             raise ValueError(f"Unsupported gate_type: {gate_type}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_logits: bool = False) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with optional stabilization.
+        
+        Args:
+            x: Input tensor [B, D]
+            return_logits: If True, return (weights, logits) tuple
+            
+        Returns:
+            weights: Softmax weights [B, E]
+            logits (optional): Raw logits before softmax [B, E]
+        """
         logits = self.net(x)
-        return torch.softmax(logits, dim=-1)
+        
+        # Add noise during training (改动 C: gate stabilization)
+        if self.training and self.noise_std > 0:
+            noise = torch.randn_like(logits) * self.noise_std
+            logits = logits + noise
+        
+        # Apply temperature scaling
+        if self.temperature != 1.0:
+            logits = logits / self.temperature
+        
+        weights = torch.softmax(logits, dim=-1)
+        
+        if return_logits:
+            return weights, logits
+        return weights
 
 
 class MMoE(nn.Module):
@@ -125,8 +166,40 @@ class MMoE(nn.Module):
         # ---- gates (per task) ----
         gate_type = str(mmoe_cfg.get("gate_type", "linear"))
         gate_hidden_dims = mmoe_cfg.get("gate_hidden_dims")
+        
+        # ============================================================
+        # 改动 C: Gate stabilization configuration
+        # ============================================================
+        gate_stabilize_cfg = mmoe_cfg.get("gate_stabilize", {}) or {}
+        self.gate_stabilize_enabled = bool(gate_stabilize_cfg.get("enabled", False))
+        self.gate_temperature = float(gate_stabilize_cfg.get("temperature", 1.0))
+        self.gate_noise_std = float(gate_stabilize_cfg.get("noise_std", 0.0))
+        self.gate_eps = float(gate_stabilize_cfg.get("eps", 1e-8))
+        self.entropy_reg_weight = float(gate_stabilize_cfg.get("entropy_reg_weight", 0.0))
+        self.load_balance_kl_weight = float(gate_stabilize_cfg.get("load_balance_kl_weight", 0.0))
+        self.gate_log_stats = bool(gate_stabilize_cfg.get("log_stats", True))
+        self.num_experts = num_experts
+        
+        if self.gate_stabilize_enabled:
+            logger.info(
+                "[MMoE] gate_stabilize enabled: temp=%.2f noise_std=%.3f "
+                "entropy_reg=%.2e lb_kl_reg=%.2e eps=%.2e",
+                self.gate_temperature, self.gate_noise_std,
+                self.entropy_reg_weight, self.load_balance_kl_weight, self.gate_eps
+            )
+        
         self.gates = nn.ModuleDict(
-            {task: _Gate(in_dim=in_dim, num_experts=num_experts, gate_type=gate_type, hidden_dims=gate_hidden_dims) for task in tasks}
+            {
+                task: _Gate(
+                    in_dim=in_dim, 
+                    num_experts=num_experts, 
+                    gate_type=gate_type, 
+                    hidden_dims=gate_hidden_dims,
+                    temperature=self.gate_temperature if self.gate_stabilize_enabled else 1.0,
+                    noise_std=self.gate_noise_std if self.gate_stabilize_enabled else 0.0,
+                ) 
+                for task in tasks
+            }
         )
 
         # ---- towers / heads ----
@@ -235,12 +308,21 @@ class MMoE(nn.Module):
 
         # Collect gate weights if logging is enabled
         gate_weights_dict: Dict[str, torch.Tensor] = {}
+        
+        # ============================================================
+        # 改动 C: Collect gate weights for regularization (keep gradient)
+        # ============================================================
+        gate_weights_for_reg: List[torch.Tensor] = []
 
         for task, head in self.towers.items():
             if task not in self.enabled_heads:
                 continue
             gate = self.gates[task]
             gate_w = gate(base_x)  # [B, E]
+            
+            # Store for regularization (keep gradient for training)
+            if self.gate_stabilize_enabled and self.training:
+                gate_weights_for_reg.append(gate_w)
 
             # Store gate weights for health monitoring if enabled
             if self.log_gates:
@@ -284,10 +366,79 @@ class MMoE(nn.Module):
         aux = dict(out.get("aux", {})) if "aux" in out else {}
         if self.log_gates and gate_weights_dict:
             aux["gates"] = gate_weights_dict
+        
+        # ============================================================
+        # 改动 C: Compute gate regularization loss (entropy + load-balance KL)
+        # Only computed during training when gate_stabilize is enabled
+        # ============================================================
+        if self.gate_stabilize_enabled and self.training and gate_weights_for_reg:
+            gate_reg_loss, gate_entropy_mean, gate_lb_kl = self._compute_gate_reg(gate_weights_for_reg)
+            aux["gate_reg_loss"] = gate_reg_loss  # Keep gradient for backprop
+            aux["gate_entropy_mean"] = gate_entropy_mean.detach()
+            aux["gate_lb_kl"] = gate_lb_kl.detach()
+        
         if aux:
             results["aux"] = aux
 
         return results
+    
+    def _compute_gate_reg(self, gate_weights_list: List[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute gate regularization: entropy regularization + load-balance KL divergence.
+        
+        改动 C: 工业常见的 gate 稳定化正则项
+        
+        Args:
+            gate_weights_list: List of gate weight tensors [B, E] for each task
+            
+        Returns:
+            gate_reg_loss: Combined regularization loss (keeps gradient)
+            gate_entropy_mean: Mean entropy across all tasks (detached, for logging)
+            gate_lb_kl: Load-balance KL divergence (detached, for logging)
+        """
+        eps = self.gate_eps
+        num_experts = self.num_experts
+        
+        # Compute in float32 for numerical stability (AMP compatibility)
+        total_entropy = torch.tensor(0.0, device=gate_weights_list[0].device, dtype=torch.float32)
+        total_kl = torch.tensor(0.0, device=gate_weights_list[0].device, dtype=torch.float32)
+        
+        for gate_w in gate_weights_list:
+            # Convert to float32 for stability
+            gate_w_f32 = gate_w.float()
+            
+            # Entropy: H = -sum(w * log(w + eps))
+            # Higher entropy = more uniform distribution (desirable to avoid collapse)
+            log_w = torch.log(gate_w_f32 + eps)
+            entropy = -torch.sum(gate_w_f32 * log_w, dim=-1)  # [B]
+            total_entropy = total_entropy + entropy.mean()
+            
+            # Load-balance KL: KL(mean_w || uniform)
+            # Measures how far the average gate assignment is from uniform
+            mean_w = gate_w_f32.mean(dim=0)  # [E]
+            uniform = torch.ones_like(mean_w) / num_experts
+            # KL(mean_w || uniform) = sum(mean_w * (log(mean_w) - log(1/E)))
+            # = sum(mean_w * log(mean_w)) + log(E)
+            kl = torch.sum(mean_w * (torch.log(mean_w + eps) - math.log(1.0 / num_experts)))
+            total_kl = total_kl + kl
+        
+        num_tasks = len(gate_weights_list)
+        mean_entropy = total_entropy / num_tasks
+        mean_kl = total_kl / num_tasks
+        
+        # Regularization loss:
+        # - Entropy term: we want HIGH entropy, so loss = -entropy (minimize -entropy = maximize entropy)
+        # - KL term: we want LOW KL (close to uniform), so loss = +KL
+        gate_reg_loss = torch.tensor(0.0, device=gate_weights_list[0].device, dtype=torch.float32)
+        
+        if self.entropy_reg_weight > 0:
+            # Negative entropy (we want to maximize entropy, so minimize -entropy)
+            gate_reg_loss = gate_reg_loss + self.entropy_reg_weight * (-mean_entropy)
+        
+        if self.load_balance_kl_weight > 0:
+            gate_reg_loss = gate_reg_loss + self.load_balance_kl_weight * mean_kl
+        
+        return gate_reg_loss, mean_entropy, mean_kl
 
 
 __all__ = ["MMoE"]

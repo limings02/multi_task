@@ -72,6 +72,9 @@ def _compute_sparse_dot(
     """
     Compute dot product and norms for two sparse tensors.
     
+    支持 embedding 梯度：稀疏张量的 values 可能是多维的（如 [nnz, embedding_dim]）。
+    在这种情况下，每个索引对应一个向量，dot product 需要对向量求内积再求和。
+    
     Returns:
         (dot_product, norm1, norm2)
     """
@@ -85,7 +88,7 @@ def _compute_sparse_dot(
     val1 = g1.values().float()
     val2 = g2.values().float()
     
-    # Norms are straightforward
+    # Norms are straightforward - flatten values to compute total norm
     norm1 = float(val1.norm().item())
     norm2 = float(val2.norm().item())
     
@@ -98,10 +101,16 @@ def _compute_sparse_dot(
         lin2 = idx2
     else:
         # Multi-dimensional sparse tensor - linearize
-        strides = torch.tensor(
-            [shape[i+1:].numel() if i < len(shape)-1 else 1 for i in range(len(shape))],
-            device=idx1.device, dtype=idx1.dtype
-        )
+        # indices shape: [sparse_dim, nnz]
+        # 只线性化稀疏维度，values 可能有额外的 dense 维度（如 embedding_dim）
+        sparse_dim = idx1.size(0)
+        strides = []
+        for d in range(sparse_dim):
+            stride = 1
+            for dd in range(d + 1, sparse_dim):
+                stride *= shape[dd]
+            strides.append(stride)
+        strides = torch.tensor(strides, device=idx1.device, dtype=idx1.dtype)
         lin1 = (idx1 * strides.unsqueeze(1)).sum(dim=0)
         lin2 = (idx2 * strides.unsqueeze(1)).sum(dim=0)
     
@@ -124,7 +133,11 @@ def _compute_sparse_dot(
         elif sorted_idx1[i] > sorted_idx2[j]:
             j += 1
         else:
-            dot += float(sorted_val1[i].item() * sorted_val2[j].item())
+            # 处理 values 可能是向量的情况（如 embedding 梯度）
+            # sorted_val1[i] 和 sorted_val2[j] 可能是向量，需要计算内积
+            v1 = sorted_val1[i].reshape(-1)  # flatten to 1D
+            v2 = sorted_val2[j].reshape(-1)  # flatten to 1D
+            dot += float(torch.dot(v1, v2).item())
             i += 1
             j += 1
     
@@ -191,6 +204,10 @@ class GradientDiagnostics:
         Uses autograd.grad to compute per-task gradients and identifies parameters
         that receive non-zero gradients from at least `min_tasks` tasks.
         
+        兜底策略（当动态识别失败时）：
+        - 排除 heads.ctr.* / heads.cvr.* 等 head 专属参数
+        - 将剩余参数全部视为共享参数
+        
         Args:
             losses_by_task: Dictionary mapping task names to their loss tensors
             force_refresh: Force recomputation even if cached
@@ -211,9 +228,11 @@ class GradientDiagnostics:
         # Track which tasks depend on each parameter
         param_task_deps: Dict[int, Set[str]] = {i: set() for i in range(len(params))}
         param_is_sparse: Dict[int, bool] = {}
+        grad_compute_failed = False
         
         for task_name, loss in losses_by_task.items():
             if loss is None or not loss.requires_grad:
+                logger.debug("resolve_shared_params: task %s loss is None or not requires_grad", task_name)
                 continue
             
             try:
@@ -226,15 +245,23 @@ class GradientDiagnostics:
                     create_graph=False,
                 )
                 
+                nonzero_count = 0
                 for idx, grad in enumerate(grads):
                     if _param_has_nonzero_grad(grad):
                         param_task_deps[idx].add(task_name)
+                        nonzero_count += 1
                         # Track if this param has sparse grads
                         if grad is not None:
                             param_is_sparse[idx] = grad.is_sparse
+                
+                logger.debug(
+                    "resolve_shared_params: task %s has %d params with nonzero grad",
+                    task_name, nonzero_count
+                )
                             
             except RuntimeError as e:
                 logger.warning("Failed to compute gradients for task %s: %s", task_name, e)
+                grad_compute_failed = True
                 continue
         
         # Identify shared parameters
@@ -254,6 +281,35 @@ class GradientDiagnostics:
                     sparse_count += 1
                 else:
                     dense_count += 1
+        
+        # ====================================================================
+        # 兜底策略：如果动态识别失败或没有找到共享参数，使用启发式规则
+        # 排除 heads.ctr.* / heads.cvr.* / heads.ctcvr.* 参数，其余视为共享
+        # ====================================================================
+        if dense_count == 0 and sparse_count == 0:
+            logger.warning(
+                "resolve_shared_params: Dynamic identification found 0 shared params. "
+                "Falling back to heuristic: all params except heads.* are shared."
+            )
+            for idx, name in enumerate(self._param_names):
+                name_low = name.lower()
+                # 排除 head 专属参数
+                if "heads.ctr" in name_low or "heads.cvr" in name_low or "heads.ctcvr" in name_low:
+                    continue
+                shared_names.append(name)
+                shared_indices.append(idx)
+                # 通过参数的 grad 属性或参数名猜测是否是 sparse
+                is_sparse = "emb" in name_low or "embedding" in name_low
+                is_sparse_mask.append(is_sparse)
+                if is_sparse:
+                    sparse_count += 1
+                else:
+                    dense_count += 1
+            
+            logger.info(
+                "Fallback: Identified %d shared params (%d dense, %d sparse) by heuristic",
+                len(shared_names), dense_count, sparse_count
+            )
         
         info = SharedParamInfo(
             shared_param_names=shared_names,

@@ -174,8 +174,14 @@ python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_tr
 - CVR 指标按 click_mask 过滤（仅在点击样本上计算） 
 - 若未安装 sklearn，AUC 字段为 null，程序不会报错 )```
 
+```bash
+python -m src.cli.main eval --config runs/deepfm_mmoe_dual_sparse_20260201_193155/config.yaml --ckpt runs/deepfm_mmoe_dual_sparse_20260201_193155/ckpt_best.pt --split valid
+```
+
 ## MMoE
+```bash
 python -m src.cli.main train --config configs/experiments/mtl_mmoe.yaml  
+```
 
 ## 更新速览
 - 新增 MMoE 多任务结构，可通过 `model.mtl=mmoe` 启用（示例：`configs/experiments/mtl_mmoe.yaml` / `configs/model/mtl_mmoe_dual_sparse.yaml`）。

@@ -74,10 +74,17 @@ class ProcessedIterDataset(IterableDataset):
             rng.seed(info.seed ^ 0xABCDEF)
         for frag in fragments:
             for batch in frag.to_batches():
-                tbl = batch.to_pydict()
-                rows = len(next(iter(tbl.values())))
+                # Optimized: use columnar format to avoid per-row dict construction overhead
+                try:
+                    cols = {name: batch.column(name).to_numpy(zero_copy_only=False) 
+                            for name in batch.schema.names}
+                except Exception:
+                    # Fallback to original method if zero_copy fails
+                    cols = batch.to_pydict()
+                
+                rows = batch.num_rows
                 for i in range(rows):
-                    row = {k: v[i] for k, v in tbl.items()}
+                    row = {k: v[i] for k, v in cols.items()}
                     if self.split_name == "train" and self.neg_keep_prob < 1.0:
                         # Down-sample only when y_ctr is negative.
                         y_ctr = row.get("y_ctr", None)
