@@ -1,0 +1,259 @@
+# ============================================================================
+# Interview Chain - E4: PLE-Lite (Homogeneous) + ESMM v2
+# ============================================================================
+# 实验定位：DeepFM shared-bottom + PLE-Lite（同构专家模式）+ ESMM v2
+# 关键变量：
+#   - model.mtl = "ple"（E4 特异）
+#   - model.ple.hetero_enabled = false（E4 特异：强制同构专家模式）
+#   - model.ple.shared_num_experts = 4
+#   - model.ple.specific_num_experts = {ctr: 1, cvr: 1}
+#   - use_esmm = true（继承 E2/E3）
+# 
+# PLE 原理：
+#   - Shared experts：所有任务共享
+#   - Private experts：每任务专属
+#   - 每任务的 gate 从 shared + 该任务的 private 中选择
+# 
+# 同构模式：所有专家架构相同（MLP with expert_mlp_dims）
+# ============================================================================
+
+experiment:
+  name: "interview_E4_deepfm_ple_lite_homo_esmm"
+
+# ESMM toggle（E4 继承 E2/E3：启用 ESMM）
+use_esmm: true
+esmm:
+  version: "v2"
+  eps: 1.0e-8
+  lambda_ctr: 1.0
+  lambda_ctcvr: 1.0
+  lambda_cvr_aux: 0.1
+
+# ============================================================================
+# Data Config（公共锁定）
+# ============================================================================
+data:
+  metadata_path: "data/processed/metadata.json"
+  batch_size: 1024                    # 公共锁定
+  num_workers: 6
+  num_workers_valid: 2
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: false
+  drop_last: false
+  debug: false
+  seed: 20260127                      # 公共锁定
+  neg_keep_prob_train: 1.0            # 不使用 negative sampling
+
+sampling:
+  negative_sampling: "none"           # ESMM 约束：必须为 none
+
+# ============================================================================
+# Embedding Config（公共锁定）
+# ============================================================================
+embedding:
+  default_embedding_dim: 8            # 公共锁定
+  embedding_dim_overrides: {}
+  mode: "sum"
+  sparse_grad: true                   # 公共锁定
+
+# ============================================================================
+# Model Config
+# ============================================================================
+model:
+  name: "deepfm_ple_lite_homo_esmm"
+  mtl: "ple"                          # E4 特异：PLE-Lite
+  enabled_heads: ["ctr", "cvr"]       # 双任务
+  tasks: ["ctr", "cvr"]               # 双任务
+  
+  # Backbone 配置（公共锁定）
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      ctr: { use_wide: true, use_fm: true }
+      cvr: { use_wide: false, use_fm: false }
+    deep_hidden_dims: [128, 64]
+    deep_dropout: 0.2
+    deep_activation: relu
+    deep_use_bn: false
+    fm_enabled: true
+    fm_projection_dim: 16
+    out_dim: 64
+  
+  # PLE-Lite 配置（E4 特异）
+  ple:
+    # 异构专家开关（E4 强制关闭）
+    hetero_enabled: false             # E4 特异：使用同构专家模式
+    
+    # 专家输出维度（同构模式必需）
+    expert_out_dim: 128
+    
+    # 同构专家配置（E4 特异）
+    shared_num_experts: 4             # 4 个共享专家
+    specific_num_experts:
+      ctr: 1                          # CTR 任务 1 个专属专家
+      cvr: 1                          # CVR 任务 1 个专属专家
+    expert_mlp_dims: [128]            # 所有专家统一架构：单层 MLP(128)
+    dropout: 0.2                      # 专家内部 dropout
+    activation: relu
+    use_bn: false
+    
+    # Gate 配置
+    gate_type: "linear"
+    gate_hidden_dims: [64]
+    log_gates: true
+    
+    # Gate 稳定化配置
+    gate_stabilize:
+      enabled: true
+      eps: 1.0e-8
+      entropy_reg_weight: 2.0e-3
+      load_balance_kl_weight: 2.0e-3
+      log_stats: true
+      schedule:
+        enabled: true
+        warm_frac: 0.2
+        temperature_start: 1.5
+        temperature_end: 1.0
+        noise_std_start: 0.05
+        noise_std_end: 0.0
+    
+    gate_reg_scope: "shared_only"
+    
+    # Shared Mass Floor（防止 private 吞噬 shared）
+    gate_shared_mass_floor:
+      enabled: false
+      per_task:
+        ctr:
+          min_mass: 0.4
+          weight: 1.0e-3
+        cvr:
+          min_mass: 0.2
+          weight: 5.0e-4
+    
+    # Input Composer 配置
+    input: "deep_h"
+    add_fm_vec: true
+    add_emb: "mean"
+    part_proj_dim: 128
+    fusion: "concat"
+    adapter_mlp_dims: [128]
+    norm: "layernorm"
+  
+  # Head 配置（公共锁定）
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    ctr: {}
+    cvr: {}
+  
+  # Deep 网络配置（公共锁定）
+  deep_hidden_dims: [256, 128]
+  deep_dropout: 0.2
+  deep_activation: "relu"
+  deep_use_bn: false
+  fm_enabled: true
+  fm_projection_dim: 16
+  out_dim: 128
+
+# ============================================================================
+# Optimizer Config（公共锁定）
+# ============================================================================
+optim:
+  type: dual_sparse_dense
+  dense:
+    lr: 0.0006
+    weight_decay: 1e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  sparse:
+    enabled: true
+    lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    allow_fallback_if_empty: false
+  lr_scheduler:
+    enabled: true
+    target: "both"
+    type: "cosine"
+    warmup_steps: 5000
+    total_steps: 40000                # 公共锁定：确保所有实验训练步数一致
+    min_lr_ratio: 0.1
+
+# ============================================================================
+# Loss Config（公共锁定）
+# ============================================================================
+loss:
+  w_ctr: 1.0
+  w_cvr: 1.0
+  eps: 1.0e-6
+  pos_weight_dynamic: false
+  static_pos_weight:
+    ctr: 1
+    ctcvr: 1
+  pos_weight_clip:
+    ctr: 30
+    ctcvr: 300
+  pos_weight_clip_schedule:
+    enabled: false
+    target: "ctcvr"
+    type: "piecewise"
+    milestones: [0, 8000]
+    values: [300, 30]
+  aux_focal:
+    enabled: false
+    warmup_steps: 8000
+    target_head: "ctcvr"
+    lambda: 0.05
+    gamma: 1.0
+    use_alpha: false
+    alpha: 0.25
+    detach_p_for_weight: true
+    compute_fp32: true
+    log_components: true
+
+# ============================================================================
+# Runtime Config（公共锁定）
+# ============================================================================
+runtime:
+  device: "cuda"
+  epochs: 1
+  log_every: 5000
+  amp: true
+  grad_diag_enabled: true
+  grad_diag_every: 1000
+  grad_diag_min_tasks: 2
+  log_health_metrics: true
+  max_train_steps: 40000              # 公共锁定：确保所有实验训练步数一致
+  max_valid_steps: null
+  grad_clip_norm: 2.0
+  seed: 20260127                      # 公共锁定
+  resume_path: null
+  auto_eval: true
+  auto_eval_split: "valid"
+  auto_eval_save_preds: true
+  auto_eval_ckpt: "best"
+  save_last: false
+  
+  # BestSelector 配置（ESMM 模式：primary=ctcvr, aux=ctr/cvr）
+  best_selection:
+    strategy: "gate"
+    primary_key: "auc_ctcvr"          # E4 继承 E2/E3：ESMM 模式下关注 CTCVR
+    aux_keys: ["auc_ctr", "auc_cvr"]
+    use_primary_ma: false
+    ma_window: 5
+    tol_primary: 0.002
+    tol_aux:
+      auc_ctr: 0.003
+      auc_cvr: 0.008
+    confirm_times: 1
+    cooldown_evals: 1
+    log_decision: true
+  
+  # 专家健康诊断（E4 保持关闭，避免干扰对比）
+  expert_health_diag:
+    enabled: false

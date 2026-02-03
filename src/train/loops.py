@@ -169,6 +169,7 @@ def train_one_epoch(
     debug_logit_every: Optional[int] = None,
     lr_scheduler_bundle: Optional["LRSchedulerBundle"] = None,
     cfg: Optional[Dict[str, Any]] = None,
+    expert_health_diag: Optional[Any] = None,  # ExpertHealthDiagnostics
 ) -> Dict[str, float]:
     """
     Train for one epoch and emit aggregated metrics plus optional gradient diagnostics.
@@ -329,6 +330,15 @@ def train_one_epoch(
                     loss_dict[mass_mean_key] = float(aux[mass_mean_key])
                 if mass_loss_key in aux:
                     loss_dict[mass_loss_key] = float(aux[mass_loss_key])
+            
+            # ============================================================
+            # 专家健康诊断: 收集 gate weights（在 backward 之前）
+            # ============================================================
+            if expert_health_diag is not None:
+                gates = aux.get("gates")
+                if gates:
+                    for task, gate_w in gates.items():
+                        expert_health_diag.collect_gate_weights(task, gate_w)
         
         t_forward_end = time.time()
         forward_time += t_forward_end - t_forward_start
@@ -446,6 +456,19 @@ def train_one_epoch(
             if lr_scheduler_enabled:
                 lr_scheduler_bundle.step()
                 last_logged_lr = lr_scheduler_bundle.get_last_lr()
+            
+            # ============================================================
+            # 专家健康诊断: 收集梯度信息（在 backward 之后、zero_grad 之前）
+            # ============================================================
+            if expert_health_diag is not None and expert_health_diag.should_log(current_global_step, "train"):
+                # 在 backward 完成后收集梯度诊断并记录
+                expert_health_diag.compute_and_log(
+                    step=current_global_step,
+                    epoch=epoch,
+                    phase="train",
+                    extra_meta={"batch_step": step},
+                )
+                expert_health_diag.reset()
 
         # ============================================================
         # pos_weight_clip schedule update (改动 B)
@@ -928,6 +951,7 @@ def validate(
     amp_device_type: str = "cuda",
     calc_auc: bool = False,
     log_health_metrics: bool = False,
+    expert_health_diag: Optional[Any] = None,  # ExpertHealthDiagnostics
 ) -> Dict[str, float]:
     model.eval()
     enabled_heads = getattr(loss_fn, "enabled_heads", {"ctr", "cvr"})
@@ -1031,6 +1055,13 @@ def validate(
                     gate_ctr_list.append(gates["ctr"].detach().cpu())
                 if "cvr" in gates:
                     gate_cvr_list.append(gates["cvr"].detach().cpu())
+            
+            # 专家健康诊断: 收集 gate weights（验证阶段）
+            if expert_health_diag is not None and expert_health_diag.config.log_on_valid:
+                aux = outputs.get("aux", {})
+                gates = aux.get("gates", {})
+                for task, gate_w in gates.items():
+                    expert_health_diag.collect_gate_weights(task, gate_w)
 
             tot_loss += loss_dict["loss_total"]
             tot_ctr += loss_dict.get("loss_ctr", 0.0)
@@ -1175,6 +1206,16 @@ def validate(
             health_metrics.update(aggregate_gate_metrics(gate_ctr_list, "ctr"))
         if gate_cvr_list:
             health_metrics.update(aggregate_gate_metrics(gate_cvr_list, "cvr"))
+    
+    # 专家健康诊断: 验证阶段结束时记录
+    if expert_health_diag is not None and expert_health_diag.config.log_on_valid:
+        expert_health_diag.compute_and_log(
+            step=0,  # 验证阶段不关注 step
+            epoch=epoch,
+            phase="valid",
+            extra_meta={"n_rows": n_rows, "steps": steps},
+        )
+        expert_health_diag.reset()
 
     return {
         "loss_total": tot_loss / steps,

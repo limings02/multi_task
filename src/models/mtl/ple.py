@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -496,10 +496,11 @@ class PLE(nn.Module):
         self._expert_output_aligner = None
         
         # 存储专家名称（用于日志/metrics）
+        # 使用明确的 [SHARE] 和 [PRIV-{task}] 前缀区分共享和私有专家
         self._expert_names: Dict[str, List[str]] = {}
         for task in tasks:
-            shared_names = [f"shared_{i}" for i in range(self.num_shared_experts)]
-            private_names = [f"{task}_private_{i}" for i in range(self.num_specific_experts[task])]
+            shared_names = [f"[SHARE]shared_{i}" for i in range(self.num_shared_experts)]
+            private_names = [f"[PRIV-{task}]private_{i}" for i in range(self.num_specific_experts[task])]
             self._expert_names[task] = shared_names + private_names
 
     def _build_hetero_experts(
@@ -547,9 +548,9 @@ class PLE(nn.Module):
             out_dim=expert_out_dim,
         )
         
-        # 记录 shared expert 名称
+        # 记录 shared expert 名称（使用 [SHARE] 前缀标注）
         shared_expert_names = [
-            spec.get("name", f"shared_{i}") for i, spec in enumerate(shared_specs)
+            f"[SHARE]{spec.get('name', f'shared_{i}')}" for i, spec in enumerate(shared_specs)
         ]
         
         # ========== 构建 task-specific experts ==========
@@ -568,8 +569,9 @@ class PLE(nn.Module):
                     in_dim=in_dim,
                     out_dim=expert_out_dim,
                 )
+                # 使用 [PRIV-{task}] 前缀标注私有专家
                 private_names = [
-                    spec.get("name", f"{task}_private_{i}") for i, spec in enumerate(task_specs)
+                    f"[PRIV-{task}]{spec.get('name', f'private_{i}')}" for i, spec in enumerate(task_specs)
                 ]
             else:
                 # 该任务没有 private experts
@@ -1020,17 +1022,20 @@ class PLE(nn.Module):
         对每个 task 计算：
           - gate_{task}_expert_top1_share: Dict[expert_name -> top1 选择频率]
           - gate_{task}_expert_mean_weight: Dict[expert_name -> 平均权重]
+          - gate_{task}_share_agg_*: share experts 的聚合指标
+          - gate_{task}_private_agg_*: private experts 的聚合指标
         
         这些指标有助于诊断：
           - 某些专家是否被忽略（权重接近 0）
           - 某些专家是否垄断了所有流量（top1 share 接近 1）
           - 异构专家是否有分化（不同类型专家被不同程度使用）
+          - Share vs Private experts 的流量分配是否合理
         
         Args:
             gate_weights_dict: Dict[task -> gate_weights [B, K]]
             
         Returns:
-            Dict containing per-task per-expert routing statistics
+            Dict containing per-task per-expert routing statistics and aggregated share/private stats
         """
         metrics: Dict[str, Any] = {}
         
@@ -1073,10 +1078,102 @@ class PLE(nn.Module):
             }
             metrics[f"gate_{task}_expert_mean_weight"] = expert_mean_weight
             
+            # ========== Share vs Private 聚合指标 ==========
+            # 根据 [SHARE] 和 [PRIV-*] 前缀分类
+            share_indices = []
+            private_indices = []
+            
+            for idx, name in enumerate(expert_names):
+                if name.startswith("[SHARE]"):
+                    share_indices.append(idx)
+                elif name.startswith("[PRIV-"):
+                    private_indices.append(idx)
+            
+            # Share experts 聚合统计
+            if share_indices:
+                share_weights = gate_w_f32[:, share_indices]  # [B, num_share]
+                share_mean_weight = float(share_weights.mean().cpu().item())
+                share_top1_count = (top1_indices.unsqueeze(1) == torch.tensor(share_indices, device=top1_indices.device)).sum().float()
+                share_top1_share = float((share_top1_count / len(top1_indices)).cpu().item())
+                
+                metrics[f"gate_{task}_share_agg_mean_weight"] = share_mean_weight
+                metrics[f"gate_{task}_share_agg_top1_share"] = share_top1_share
+            
+            # Private experts 聚合统计
+            if private_indices:
+                private_weights = gate_w_f32[:, private_indices]  # [B, num_private]
+                private_mean_weight = float(private_weights.mean().cpu().item())
+                private_top1_count = (top1_indices.unsqueeze(1) == torch.tensor(private_indices, device=top1_indices.device)).sum().float()
+                private_top1_share = float((private_top1_count / len(top1_indices)).cpu().item())
+                
+                metrics[f"gate_{task}_private_agg_mean_weight"] = private_mean_weight
+                metrics[f"gate_{task}_private_agg_top1_share"] = private_top1_share
+            
             # ========== 额外指标：是否启用了异构专家 ==========
             metrics["hetero_experts_enabled"] = self._use_hetero_experts
         
         return metrics
+
+    def get_expert_health_data(self) -> Dict[str, Any]:
+        """
+        获取专家健康诊断所需的模型内部数据。
+        
+        用于 ExpertHealthDiagnostics 收集诊断数据。
+        
+        Returns:
+            Dict containing:
+              - expert_modules: List[(name, module)] 所有专家模块
+              - expert_names: Dict[task -> List[str]] 每任务专家名称
+              - aligners: Dict[task -> module] 每任务的 output aligner
+              - hetero_enabled: bool 是否启用异构专家
+        """
+        data: Dict[str, Any] = {
+            "hetero_enabled": self._use_hetero_experts,
+            "expert_names": self._expert_names.copy() if self._expert_names else {},
+        }
+        
+        # 收集所有专家模块
+        expert_modules: List[Tuple[str, torch.nn.Module]] = []
+        
+        # Shared experts
+        for i, expert in enumerate(self.shared_experts):
+            name = f"[SHARE]shared_{i}"
+            # 尝试从配置获取实际名称
+            if hasattr(self, "_expert_names"):
+                for task_names in self._expert_names.values():
+                    for n in task_names:
+                        if n.startswith("[SHARE]") and f"_{i}" in n:
+                            name = n
+                            break
+                    break
+            expert_modules.append((name, expert))
+        
+        # Task-specific experts
+        for task, experts in self.specific_experts.items():
+            for i, expert in enumerate(experts):
+                name = f"[PRIV-{task}]private_{i}"
+                if task in self._expert_names:
+                    private_names = [n for n in self._expert_names[task] if f"[PRIV-{task}]" in n]
+                    if i < len(private_names):
+                        name = private_names[i]
+                expert_modules.append((name, expert))
+        
+        data["expert_modules"] = expert_modules
+        
+        # 收集 aligners
+        aligners = {}
+        if self._expert_output_aligner is not None:
+            # PerTaskExpertAligner 包含多个任务的 aligner
+            if hasattr(self._expert_output_aligner, "aligners"):
+                for task, aligner in self._expert_output_aligner.aligners.items():
+                    aligners[task] = aligner
+            else:
+                # 单个 aligner（兼容旧版本）
+                aligners["default"] = self._expert_output_aligner
+        
+        data["aligners"] = aligners
+        
+        return data
 
 
 __all__ = ["PLE"]

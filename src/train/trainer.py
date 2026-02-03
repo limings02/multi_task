@@ -304,6 +304,34 @@ class Trainer:
         if self.log_health_metrics:
             self.logger.info("Health metrics logging enabled (log_health_metrics=true)")
 
+        # ===== Expert Health Diagnostics (专家健康诊断) =====
+        from src.utils.expert_health_diag import ExpertHealthDiagConfig, ExpertHealthDiagnostics
+        expert_health_cfg = runtime_cfg.get("expert_health_diag", {})
+        self.expert_health_diag_config = ExpertHealthDiagConfig.from_dict(expert_health_cfg)
+        self.expert_health_diag: Optional[ExpertHealthDiagnostics] = None
+        
+        if self.expert_health_diag_config.enabled:
+            self.expert_health_diag = ExpertHealthDiagnostics(
+                config=self.expert_health_diag_config,
+                run_dir=self.run_dir,
+            )
+            # 设置模型内部数据引用（如果模型支持）
+            if hasattr(self.model, "ple") and hasattr(self.model.ple, "get_expert_health_data"):
+                health_data = self.model.ple.get_expert_health_data()
+                self.expert_health_diag.set_expert_modules(health_data.get("expert_modules", []))
+                self.expert_health_diag.set_aligners(health_data.get("aligners", {}))
+                for task, names in health_data.get("expert_names", {}).items():
+                    self.expert_health_diag.set_expert_names(task, names)
+                self.logger.info(
+                    "[ExpertHealthDiag] Initialized: log_interval=%d, log_on_valid=%s",
+                    self.expert_health_diag_config.log_interval,
+                    self.expert_health_diag_config.log_on_valid,
+                )
+            else:
+                self.logger.warning(
+                    "[ExpertHealthDiag] Enabled but model does not support expert health data collection"
+                )
+
         # ===== Best model selection strategy (gate or legacy auc_primary) =====
         best_selection_cfg = runtime_cfg.get("best_selection", {})
         strategy = best_selection_cfg.get("strategy", "auc_primary")
@@ -377,6 +405,7 @@ class Trainer:
                     amp_device_type=self.amp_device_type,
                     calc_auc=True,
                     log_health_metrics=self.log_health_metrics,
+                    expert_health_diag=self.expert_health_diag,
                 )
 
             def _on_eval(val_metrics: Dict[str, Any], g_step: int, ep: int) -> None:
@@ -448,6 +477,7 @@ class Trainer:
                 debug_logit_every=self.debug_logit_every,
                 lr_scheduler_bundle=self.lr_scheduler_bundle,
                 cfg=self.cfg,
+                expert_health_diag=self.expert_health_diag,
             )
             self.global_step += train_metrics.get("steps", 0)
             train_record = {"epoch": epoch, "split": "train", **train_metrics}
@@ -466,6 +496,7 @@ class Trainer:
                 amp_dtype=self.amp_dtype,
                 calc_auc=True,
                 log_health_metrics=self.log_health_metrics,
+                expert_health_diag=self.expert_health_diag,
             )
             valid_record = {"epoch": epoch, "split": "valid", **valid_metrics}
             self._write_metrics(valid_record)

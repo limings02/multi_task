@@ -1,0 +1,180 @@
+# ============================================================================
+# Interview Chain - E0b: Single-Task CVR Baseline
+# ============================================================================
+# 实验定位：单任务 CVR 基线（DeepFM，只有 cvr head）
+# 关键变量：
+#   - model.enabled_heads = ["cvr"]
+#   - model.tasks = ["cvr"]
+#   - use_esmm = false（单任务不需要 ESMM）
+#   - best_selection.primary_key = "auc_cvr"
+# 
+# 注意：CVR 样本稀疏，只在 click=1 的样本上训练（这是数据集特性，不是配置项）
+# ============================================================================
+
+experiment:
+  name: "interview_E0b_deepfm_st_cvr"
+
+# ESMM toggle（单任务不使用 ESMM）
+use_esmm: false
+
+# ============================================================================
+# Data Config（公共锁定）
+# ============================================================================
+data:
+  metadata_path: "data/processed/metadata.json"
+  batch_size: 1024                    # 公共锁定
+  num_workers: 6
+  num_workers_valid: 2
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: false
+  drop_last: false
+  debug: false
+  seed: 20260127                      # 公共锁定
+  neg_keep_prob_train: 1.0            # 不使用 negative sampling
+
+sampling:
+  negative_sampling: "none"           # 所有实验统一为 none
+
+# ============================================================================
+# Embedding Config（公共锁定）
+# ============================================================================
+embedding:
+  default_embedding_dim: 8            # 公共锁定
+  embedding_dim_overrides: {}
+  mode: "sum"
+  sparse_grad: true                   # 公共锁定
+
+# ============================================================================
+# Model Config
+# ============================================================================
+model:
+  name: "deepfm_st_cvr"
+  mtl: "sharedbottom"                 # 单任务也用 sharedbottom（只有一个 head）
+  enabled_heads: ["cvr"]              # E0b 特异：只有 cvr
+  tasks: ["cvr"]                      # E0b 特异：只有 cvr
+  
+  # Backbone 配置（公共锁定）
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      # CTR head 不存在，无需配置
+      cvr: { use_wide: false, use_fm: false }
+    deep_hidden_dims: [128, 64]
+    deep_dropout: 0.2
+    deep_activation: relu
+    deep_use_bn: false
+    fm_enabled: true
+    fm_projection_dim: 16
+    out_dim: 64
+  
+  # Head 配置（公共锁定）
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    cvr: {}
+  
+  # Deep 网络配置（公共锁定）
+  deep_hidden_dims: [256, 128]
+  deep_dropout: 0.2
+  deep_activation: "relu"
+  deep_use_bn: false
+  fm_enabled: true
+  fm_projection_dim: 16
+  out_dim: 128
+
+# ============================================================================
+# Optimizer Config（公共锁定）
+# ============================================================================
+optim:
+  type: dual_sparse_dense
+  dense:
+    lr: 0.0006
+    weight_decay: 1e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  sparse:
+    enabled: true
+    lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    allow_fallback_if_empty: false
+  lr_scheduler:
+    enabled: true
+    target: "both"
+    type: "cosine"
+    warmup_steps: 5000
+    total_steps: 40000                # 公共锁定：确保所有实验训练步数一致
+    min_lr_ratio: 0.1
+
+# ============================================================================
+# Loss Config（公共锁定）
+# ============================================================================
+loss:
+  w_ctr: 1.0                          # CTR 不存在，但保留字段避免报错
+  w_cvr: 1.0
+  eps: 1.0e-6
+  pos_weight_dynamic: false
+  static_pos_weight:
+    ctr: 1
+    ctcvr: 1
+  pos_weight_clip:
+    ctr: 30
+    ctcvr: 300
+  pos_weight_clip_schedule:
+    enabled: false
+    target: "ctcvr"
+    type: "piecewise"
+    milestones: [0, 8000]
+    values: [300, 30]
+  aux_focal:
+    enabled: false
+    warmup_steps: 8000
+    target_head: "ctcvr"
+    lambda: 0.05
+    gamma: 1.0
+    use_alpha: false
+    alpha: 0.25
+    detach_p_for_weight: true
+    compute_fp32: true
+    log_components: true
+
+# ============================================================================
+# Runtime Config（公共锁定）
+# ============================================================================
+runtime:
+  device: "cuda"
+  epochs: 1
+  log_every: 5000
+  amp: true
+  grad_diag_enabled: true
+  grad_diag_every: 1000
+  grad_diag_min_tasks: 2              # 单任务时不会触发，但保留字段
+  log_health_metrics: true
+  max_train_steps: 40000              # 公共锁定：确保所有实验训练步数一致
+  max_valid_steps: null
+  grad_clip_norm: 2.0
+  seed: 20260127                      # 公共锁定
+  resume_path: null
+  auto_eval: true
+  auto_eval_split: "valid"
+  auto_eval_save_preds: true
+  auto_eval_ckpt: "best"
+  save_last: false
+  
+  # BestSelector 配置（E0b 特异：只关注 auc_cvr）
+  best_selection:
+    strategy: "gate"
+    primary_key: "auc_cvr"            # E0b 特异：单任务 CVR 主指标
+    aux_keys: []                      # 无辅助指标
+    use_primary_ma: false
+    ma_window: 5
+    tol_primary: 0.002
+    tol_aux: {}
+    confirm_times: 1
+    cooldown_evals: 1
+    log_decision: true

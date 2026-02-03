@@ -1,0 +1,191 @@
+# ============================================================================
+# Interview Chain - E2: Hard Sharing + ESMM v2
+# ============================================================================
+# 实验定位：E1 + ESMM v2（p_ctcvr = p_ctr * p_cvr，且带 cvr_aux_loss）
+# 关键变量：
+#   - use_esmm = true（E2 特异）
+#   - esmm.version = "v2"
+#   - esmm.lambda_cvr_aux = 0.1（在 click=1 subset 上的 cvr 辅助损失）
+#   - best_selection.primary_key = "auc_ctcvr"（ESMM 模式下关注 CTCVR）
+# 
+# ESMM 约束：
+#   - 必须禁用 negative_sampling（sampling.negative_sampling = "none"）
+#   - CVR 不再在 click=1 subset 上训练，而是通过 ESMM 公式约束
+# ============================================================================
+
+experiment:
+  name: "interview_E2_deepfm_shared_esmm"
+
+# ESMM toggle（E2 启用 ESMM）
+use_esmm: true
+esmm:
+  version: "v2"
+  eps: 1.0e-8
+  lambda_ctr: 1.0
+  lambda_ctcvr: 1.0
+  lambda_cvr_aux: 0.1                 # click=1 subset 上的 cvr 辅助损失
+
+# ============================================================================
+# Data Config（公共锁定）
+# ============================================================================
+data:
+  metadata_path: "data/processed/metadata.json"
+  batch_size: 1024                    # 公共锁定
+  num_workers: 6
+  num_workers_valid: 2
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: false
+  drop_last: false
+  debug: false
+  seed: 20260127                      # 公共锁定
+  neg_keep_prob_train: 1.0            # 不使用 negative sampling
+
+sampling:
+  negative_sampling: "none"           # ESMM 约束：必须为 none
+
+# ============================================================================
+# Embedding Config（公共锁定）
+# ============================================================================
+embedding:
+  default_embedding_dim: 8            # 公共锁定
+  embedding_dim_overrides: {}
+  mode: "sum"
+  sparse_grad: true                   # 公共锁定
+
+# ============================================================================
+# Model Config
+# ============================================================================
+model:
+  name: "deepfm_shared_esmm"
+  mtl: "sharedbottom"                 # E2 继承 E1：Hard Sharing
+  enabled_heads: ["ctr", "cvr"]       # 双任务
+  tasks: ["ctr", "cvr"]               # 双任务
+  
+  # Backbone 配置（公共锁定）
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      ctr: { use_wide: true, use_fm: true }
+      cvr: { use_wide: false, use_fm: false }
+    deep_hidden_dims: [128, 64]
+    deep_dropout: 0.2
+    deep_activation: relu
+    deep_use_bn: false
+    fm_enabled: true
+    fm_projection_dim: 16
+    out_dim: 64
+  
+  # Head 配置（公共锁定）
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    ctr: {}
+    cvr: {}
+  
+  # Deep 网络配置（公共锁定）
+  deep_hidden_dims: [256, 128]
+  deep_dropout: 0.2
+  deep_activation: "relu"
+  deep_use_bn: false
+  fm_enabled: true
+  fm_projection_dim: 16
+  out_dim: 128
+
+# ============================================================================
+# Optimizer Config（公共锁定）
+# ============================================================================
+optim:
+  type: dual_sparse_dense
+  dense:
+    lr: 0.0006
+    weight_decay: 1e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  sparse:
+    enabled: true
+    lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    allow_fallback_if_empty: false
+  lr_scheduler:
+    enabled: true
+    target: "both"
+    type: "cosine"
+    warmup_steps: 5000
+    total_steps: 40000                # 公共锁定：确保所有实验训练步数一致
+    min_lr_ratio: 0.1
+
+# ============================================================================
+# Loss Config（公共锁定）
+# ============================================================================
+loss:
+  w_ctr: 1.0
+  w_cvr: 1.0
+  eps: 1.0e-6
+  pos_weight_dynamic: false
+  static_pos_weight:
+    ctr: 1
+    ctcvr: 1
+  pos_weight_clip:
+    ctr: 30
+    ctcvr: 300
+  pos_weight_clip_schedule:
+    enabled: false
+    target: "ctcvr"
+    type: "piecewise"
+    milestones: [0, 8000]
+    values: [300, 30]
+  aux_focal:
+    enabled: false
+    warmup_steps: 8000
+    target_head: "ctcvr"
+    lambda: 0.05
+    gamma: 1.0
+    use_alpha: false
+    alpha: 0.25
+    detach_p_for_weight: true
+    compute_fp32: true
+    log_components: true
+
+# ============================================================================
+# Runtime Config（公共锁定）
+# ============================================================================
+runtime:
+  device: "cuda"
+  epochs: 1
+  log_every: 5000
+  amp: true
+  grad_diag_enabled: true
+  grad_diag_every: 1000
+  grad_diag_min_tasks: 2
+  log_health_metrics: true
+  max_train_steps: 40000              # 公共锁定：确保所有实验训练步数一致
+  max_valid_steps: null
+  grad_clip_norm: 2.0
+  seed: 20260127                      # 公共锁定
+  resume_path: null
+  auto_eval: true
+  auto_eval_split: "valid"
+  auto_eval_save_preds: true
+  auto_eval_ckpt: "best"
+  save_last: false
+  
+  # BestSelector 配置（ESMM 模式：primary=ctcvr, aux=ctr/cvr）
+  best_selection:
+    strategy: "gate"
+    primary_key: "auc_ctcvr"          # E2 特异：ESMM 模式下关注 CTCVR
+    aux_keys: ["auc_ctr", "auc_cvr"]
+    use_primary_ma: false
+    ma_window: 5
+    tol_primary: 0.002
+    tol_aux:
+      auc_ctr: 0.003
+      auc_cvr: 0.008
+    confirm_times: 1
+    cooldown_evals: 1
+    log_decision: true
