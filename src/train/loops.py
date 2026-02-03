@@ -208,6 +208,8 @@ def train_one_epoch(
     grad_cos_sparse_vals: List[float] = []
     grad_cos_all_vals: List[float] = []
     conflict_hits = 0
+    conflict_hits_dense = 0  # 新增：独立统计 dense 冲突
+    conflict_hits_sparse = 0  # 新增：独立统计 sparse 冲突
     grad_samples = 0
     shared_dense_count_last = 0
     shared_sparse_count_last = 0
@@ -279,6 +281,16 @@ def train_one_epoch(
         if hasattr(loss_fn, "global_step"):
             loss_fn.global_step = current_global_step
 
+        # Update step in model for gate schedule (PLE temperature/noise decay)
+        if hasattr(model, "set_step"):
+            # 尝试从 lr_scheduler_bundle 获取 total_steps
+            total_steps = getattr(lr_scheduler_bundle, "total_steps", 0) if lr_scheduler_bundle else 0
+            if total_steps == 0 and cfg:
+                # fallback: 从 cfg 中读取
+                total_steps = cfg.get("optim", {}).get("lr_scheduler", {}).get("total_steps", 0)
+            if total_steps > 0:
+                model.set_step(current_global_step, total_steps)
+
         labels = _to_device_labels(labels, device)
         features_dev = _to_device_features(features, device)
 
@@ -306,6 +318,17 @@ def train_one_epoch(
                     loss_dict["gate_entropy_mean"] = float(gate_entropy_mean.cpu().item())
                 if gate_lb_kl is not None:
                     loss_dict["gate_lb_kl"] = float(gate_lb_kl.cpu().item())
+            
+            # ============================================================
+            # 新增: shared mass floor metrics（gate_shared_mass_mean_{task}, gate_shared_mass_floor_loss_{task}）
+            # ============================================================
+            for task in ["ctr", "cvr"]:
+                mass_mean_key = f"gate_shared_mass_mean_{task}"
+                mass_loss_key = f"gate_shared_mass_floor_loss_{task}"
+                if mass_mean_key in aux:
+                    loss_dict[mass_mean_key] = float(aux[mass_mean_key])
+                if mass_loss_key in aux:
+                    loss_dict[mass_loss_key] = float(aux[mass_loss_key])
         
         t_forward_end = time.time()
         forward_time += t_forward_end - t_forward_start
@@ -606,10 +629,15 @@ def train_one_epoch(
                 cos_sparse = diag_metrics.get("grad_cosine_shared_sparse")
                 cos_all = diag_metrics.get("grad_cosine_shared_all")
                 
+                # 修复 conflict_rate 统计：分别统计 dense/sparse/all 的冲突
                 if cos_dense is not None:
                     grad_cos_dense_vals.append(cos_dense)
+                    if cos_dense < 0:
+                        conflict_hits_dense += 1
                 if cos_sparse is not None:
                     grad_cos_sparse_vals.append(cos_sparse)
+                    if cos_sparse < 0:
+                        conflict_hits_sparse += 1
                 if cos_all is not None:
                     grad_cos_all_vals.append(cos_all)
                     if cos_all < 0:
@@ -710,6 +738,17 @@ def train_one_epoch(
             if gate_lb_kl is not None:
                 log_parts.append(f"gate_lb_kl={gate_lb_kl:.6f}")
             
+            # ============================================================
+            # 新增: Log shared mass floor metrics
+            # ============================================================
+            for task in ["ctr", "cvr"]:
+                mass_mean = loss_dict.get(f"gate_shared_mass_mean_{task}")
+                mass_loss = loss_dict.get(f"gate_shared_mass_floor_loss_{task}")
+                if mass_mean is not None:
+                    log_parts.append(f"mass_shared_{task}={mass_mean:.4f}")
+                if mass_loss is not None and mass_loss > 1e-8:
+                    log_parts.append(f"mass_floor_loss_{task}={mass_loss:.6f}")
+            
             # Add performance metrics
             log_parts.append(f"samples={n_rows} steps/s={steps_per_sec:.2f} samples/s={samples_per_sec:.1f}")
             log_parts.append(f"time={elapsed:.2f}s")
@@ -720,7 +759,7 @@ def train_one_epoch(
             # Reset timing counters after logging
             data_load_time = forward_time = backward_time = optim_time = 0.0
 
-        if eval_every_steps and validate_fn and (current_global_step % eval_every_steps == 0):
+        if eval_every_steps and validate_fn and (current_global_step > 0 and current_global_step % eval_every_steps == 0):
             # Mid-epoch validation at the same cadence as training logs.
             # validate_fn must switch the model to eval/no_grad internally; we switch back to train afterwards.
             val_metrics = validate_fn()
@@ -787,7 +826,7 @@ def train_one_epoch(
         "grad_cosine_p50": grad_cos_all_p50,
         "grad_cosine_p90": grad_cos_all_p90,
         
-        # Conflict detection
+        # Conflict detection (只保留 all 的冲突率字段，避免破坏 schema)
         "conflict_rate": (conflict_hits / grad_samples) if grad_samples else None,
         "grad_samples": grad_samples,
         
@@ -795,6 +834,22 @@ def train_one_epoch(
         "shared_dense_count": shared_dense_count_last if grad_samples > 0 else None,
         "shared_sparse_count": shared_sparse_count_last if grad_samples > 0 else None,
     }
+    
+    # 打印详细的冲突率诊断信息（不新增 metrics 字段）
+    if grad_samples > 0:
+        conflict_rate_dense = (conflict_hits_dense / len(grad_cos_dense_vals)) if grad_cos_dense_vals else None
+        conflict_rate_sparse = (conflict_hits_sparse / len(grad_cos_sparse_vals)) if grad_cos_sparse_vals else None
+        conflict_rate_all = (conflict_hits / grad_samples) if grad_samples else None
+        _diag_logger.info(
+            "[grad_conflict_diagnosis] epoch=%d samples=%d | "
+            "conflict_rate: dense=%.3f (%d/%d), sparse=%.3f (%d/%d), all=%.3f (%d/%d) | "
+            "cosine_p10: dense=%.3f, sparse=%.3f, all=%.3f",
+            epoch, grad_samples,
+            conflict_rate_dense or 0.0, conflict_hits_dense, len(grad_cos_dense_vals) if grad_cos_dense_vals else 0,
+            conflict_rate_sparse or 0.0, conflict_hits_sparse, len(grad_cos_sparse_vals) if grad_cos_sparse_vals else 0,
+            conflict_rate_all or 0.0, conflict_hits, grad_samples,
+            grad_cos_dense_p10 or 0.0, grad_cos_sparse_p10 or 0.0, grad_cos_all_p10 or 0.0,
+        )
 
     # ESMM-specific metrics
     esmm_metrics = {}
@@ -1077,7 +1132,12 @@ def validate(
             )
             auc_ctcvr = ctcvr_metrics.get("auc")
         if auc_vals:
-            auc_primary = float(sum(auc_vals) / len(auc_vals))
+            if use_esmm and auc_ctr is not None and auc_cvr is not None and auc_ctcvr is not None:
+                # ESMM mode: weighted combination
+                auc_primary = float(1.0 * auc_ctcvr + 0.2 * auc_ctr + 0.2 * auc_cvr)
+            else:
+                # Non-ESMM mode: simple average
+                auc_primary = float(sum(auc_vals) / len(auc_vals))
 
     # Health monitoring metrics (only computed when log_health_metrics=True and calc_auc=True)
     health_metrics: Dict[str, Any] = {}

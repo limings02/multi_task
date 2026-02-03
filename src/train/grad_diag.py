@@ -285,6 +285,9 @@ class GradientDiagnostics:
         # ====================================================================
         # 兜底策略：如果动态识别失败或没有找到共享参数，使用启发式规则
         # 排除 heads.ctr.* / heads.cvr.* / heads.ctcvr.* 参数，其余视为共享
+        # 
+        # 修复说明：is_sparse_mask 在兜底时无法准确判断（因为没有实际梯度信息）
+        # 统一设为 False，让后续 compute_metrics 根据实际梯度类型重新判断
         # ====================================================================
         if dense_count == 0 and sparse_count == 0:
             logger.warning(
@@ -298,17 +301,14 @@ class GradientDiagnostics:
                     continue
                 shared_names.append(name)
                 shared_indices.append(idx)
-                # 通过参数的 grad 属性或参数名猜测是否是 sparse
-                is_sparse = "emb" in name_low or "embedding" in name_low
-                is_sparse_mask.append(is_sparse)
-                if is_sparse:
-                    sparse_count += 1
-                else:
-                    dense_count += 1
+                # 修复：不再通过参数名猜测 is_sparse，统一设为 False
+                # 实际 sparse/dense 判断将在 compute_metrics 中根据梯度类型重新判断
+                is_sparse_mask.append(False)
+                dense_count += 1  # 暂时全部计为 dense，后续会根据实际梯度修正
             
             logger.info(
-                "Fallback: Identified %d shared params (%d dense, %d sparse) by heuristic",
-                len(shared_names), dense_count, sparse_count
+                "Fallback: Identified %d shared params by heuristic (sparse/dense will be determined by actual gradients)",
+                len(shared_names)
             )
         
         info = SharedParamInfo(
@@ -395,6 +395,9 @@ class GradientDiagnostics:
             - grad_cosine_shared_dense (if applicable)
             - grad_cosine_shared_sparse (if applicable)
             - conflict_detected (bool)
+            
+        NOTE: norm 和 cosine 必须基于相同的参数子集计算，以确保指标自洽。
+        当某个任务的某参数梯度为 None 时，该参数从两个任务的统计中同时排除。
         """
         if shared_info is None:
             shared_info = self.resolve_shared_params(losses_by_task)
@@ -419,14 +422,56 @@ class GradientDiagnostics:
         task_grads = self.compute_task_grads(losses_by_task, shared_info)
         task_names = list(losses_by_task.keys())
         
-        # Compute norms for each task
+        # ====================================================================
+        # 修复：norm 和 cosine 必须基于相同的参数子集计算
+        # 策略：先找出所有任务都有非 None 梯度的参数子集（common_valid_mask）
+        # 然后 norm 和 cosine 都只在这个子集上计算
+        # ====================================================================
+        n_params = len(shared_info.shared_param_indices)
+        
+        # 找出所有任务都有有效梯度的参数索引
+        common_valid_mask = [True] * n_params
+        for task in task_names:
+            grads = task_grads[task]
+            for i, grad in enumerate(grads):
+                if grad is None:
+                    common_valid_mask[i] = False
+        
+        # 同时更新 is_sparse_mask：基于实际梯度类型而非预设（修复 is_sparse 判断不准问题）
+        actual_is_sparse_mask = []
+        for i in range(n_params):
+            if common_valid_mask[i]:
+                # 用第一个任务的实际梯度类型来判断
+                first_task_grad = task_grads[task_names[0]][i]
+                actual_is_sparse_mask.append(first_task_grad.is_sparse if first_task_grad is not None else False)
+            else:
+                actual_is_sparse_mask.append(False)
+        
+        # 计算有效参数数量
+        valid_count = sum(common_valid_mask)
+        if valid_count == 0:
+            # 没有任何参数同时被所有任务使用，所有指标置为 None
+            logger.debug(
+                "compute_metrics: No common valid gradients across tasks %s, all metrics set to None",
+                task_names
+            )
+            for task in task_names:
+                metrics[f"grad_norm_shared_{task}"] = None
+            metrics["grad_cosine_shared_dense"] = None
+            metrics["grad_cosine_shared_sparse"] = None
+            metrics["grad_cosine_shared_all"] = None
+            metrics["conflict_detected"] = None
+            return metrics
+        
+        # Compute norms for each task（只在 common_valid_mask 为 True 的参数上）
         for task in task_names:
             grads = task_grads[task]
             total_norm_sq = 0.0
-            for grad in grads:
+            for i, grad in enumerate(grads):
+                if not common_valid_mask[i]:
+                    continue  # 跳过不在公共子集的参数
                 if grad is not None:
                     if grad.is_sparse:
-                        # Must coalesce before accessing values
                         grad_c = grad.coalesce()
                         norm_val = float(grad_c.values().float().norm().item())
                     else:
@@ -434,13 +479,25 @@ class GradientDiagnostics:
                     total_norm_sq += norm_val ** 2
             metrics[f"grad_norm_shared_{task}"] = total_norm_sq ** 0.5 if total_norm_sq > 0 else 0.0
         
-        # Compute pairwise cosine similarities
-        # For simplicity, focus on first two tasks (typically CTR and CTCVR)
+        # 诊断日志：说明哪些任务有 grad_norm，避免静默 null
+        norm_status = {task: ("valid" if metrics.get(f"grad_norm_shared_{task}") is not None else "null") 
+                       for task in task_names}
+        logger.debug(
+            "compute_metrics: tasks=%s, valid_params=%d/%d, grad_norm status=%s",
+            task_names, valid_count, n_params, norm_status
+        )
+        
+        # Compute pairwise cosine similarities（同样只在 common_valid_mask 上）
         if len(task_names) >= 2:
+            # 过滤出 common_valid 的梯度子列表
+            grads1_valid = [task_grads[task_names[0]][i] for i in range(n_params) if common_valid_mask[i]]
+            grads2_valid = [task_grads[task_names[1]][i] for i in range(n_params) if common_valid_mask[i]]
+            is_sparse_valid = [actual_is_sparse_mask[i] for i in range(n_params) if common_valid_mask[i]]
+            
             cosine_dense, cosine_sparse, cosine_all = self._compute_pairwise_cosine(
-                task_grads[task_names[0]],
-                task_grads[task_names[1]],
-                shared_info.is_sparse_mask,
+                grads1_valid,
+                grads2_valid,
+                is_sparse_valid,
             )
             metrics["grad_cosine_shared_dense"] = cosine_dense
             metrics["grad_cosine_shared_sparse"] = cosine_sparse
@@ -477,11 +534,18 @@ class GradientDiagnostics:
         sparse_norm2_sq = 0.0
         sparse_count = 0
         
+        # NOTE: 调用方已确保 grads1/grads2 中不会有 None（已通过 common_valid_mask 过滤）
+        # 但为安全起见仍保留检查
         for g1, g2, is_sparse in zip(grads1, grads2, is_sparse_mask):
             if g1 is None or g2 is None:
+                # 理论上不应该进入这里（调用方已过滤），但保留防御性检查
+                logger.debug("_compute_pairwise_cosine: skipping None gradient (should not happen after fix)")
                 continue
             
-            if is_sparse and g1.is_sparse and g2.is_sparse:
+            # 判断是否是 sparse：优先用实际梯度类型，而非 is_sparse_mask（可能不准）
+            actual_sparse = g1.is_sparse and g2.is_sparse
+            
+            if actual_sparse:
                 # Sparse gradient handling
                 dot, n1, n2 = _compute_sparse_dot(g1, g2)
                 sparse_dot += dot
@@ -489,7 +553,7 @@ class GradientDiagnostics:
                 sparse_norm2_sq += n2 ** 2
                 sparse_count += 1
             else:
-                # Dense gradient handling (or mixed - treat as dense)
+                # Dense gradient handling (or mixed - convert to dense)
                 g1_flat = g1.float().reshape(-1) if not g1.is_sparse else g1.to_dense().float().reshape(-1)
                 g2_flat = g2.float().reshape(-1) if not g2.is_sparse else g2.to_dense().float().reshape(-1)
                 dense_dot += float(torch.dot(g1_flat, g2_flat).item())

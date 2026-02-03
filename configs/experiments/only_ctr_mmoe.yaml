@@ -1,8 +1,8 @@
 experiment:
-  name: "deepfm_mmoe_dual_sparse"
+  name: "A_only_ctr"
 
 # ESMM toggle (default off to preserve legacy behaviour)
-use_esmm: true
+use_esmm: false
 esmm:
   version: "v2"  # "v2" (standard ESMM: p_ctcvr = p_ctr * p_cvr) or "legacy" (deprecated)
   eps: 1.0e-8
@@ -15,7 +15,7 @@ data:
   batch_size: 1024
   num_workers: 6
   num_workers_valid: 2  # Use fewer workers for validation
-  prefetch_factor: 4
+  prefetch_factor: 2
   pin_memory: true
   persistent_workers: true
   drop_last: false
@@ -35,8 +35,8 @@ embedding:
 model:
   name: "deepfm_mmoe"
   mtl: "mmoe"
-  enabled_heads: ["ctr", "cvr"]
-  tasks: ["ctr", "cvr"]
+  enabled_heads: ["ctr"]
+  tasks: ["ctr"]
   backbone:
     use_legacy_pseudo_deepfm: false
     return_logit_parts: true
@@ -118,20 +118,20 @@ optim:
 
 loss:
   w_ctr: 1.0
-  w_cvr: 1.0
+  w_cvr: 0.0
   eps: 1.0e-6
   pos_weight_dynamic: false
   static_pos_weight:
     ctr: 24.7          #24.7
-    ctcvr: 4800           #4800
+    # ctcvr: 4800           #4800
   pos_weight_clip:
     ctr: 30
-    ctcvr: 300
+    # ctcvr: 300
   # ============================================================
   # 改动 B: pos_weight_clip 调度配置
   # ============================================================
   pos_weight_clip_schedule:
-    enabled: true
+    enabled: false
     target: "ctcvr"          # "ctcvr" | "ctr" | "both"
     type: "piecewise"        # "piecewise" 分段 | "linear" 线性
     # piecewise 方案：按里程碑切换
@@ -155,7 +155,7 @@ loss:
   #   - gamma: 1.0, 2.0
   #   - warmup_steps: 1000, 2000
   aux_focal:
-    enabled: true              # 开关：true 启用，false 禁用（默认禁用以保持向后兼容）
+    enabled: false              # 开关：true 启用，false 禁用（默认禁用以保持向后兼容）
     warmup_steps: 8000         # warmup 步数：前 N step 不启用 aux focal
     target_head: "ctcvr"       # 目标 head（固定为 ctcvr，不要改为 ctr）
     lambda: 0.05                # focal 辅助项系数（推荐 sweep: 0.05/0.1/0.2）
@@ -172,7 +172,7 @@ runtime:
   log_every: 5000
   amp: true
   grad_diag_enabled: true  # Enable new dynamic gradient diagnostics
-  grad_diag_every: 1000    # Run at same frequency as logging (null = use log_every)
+  grad_diag_every: 10000    # Run at same frequency as logging (null = use log_every)
   grad_diag_min_tasks: 2   # Minimum tasks for shared param identification
   log_health_metrics: true  # Enable health metrics logging
   max_train_steps: 40000

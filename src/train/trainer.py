@@ -20,6 +20,7 @@ from src.models.build import build_model
 from src.eval.run_eval import run_eval
 from src.train.loops import train_one_epoch, validate
 from src.train.optim import build_optimizer_bundle, build_lr_scheduler_bundle, LRSchedulerBundle
+from src.train.best_selector import BestSelector
 from src.utils.feature_meta import build_model_feature_meta
 from src.utils.metrics_schema import apply_esmm_schema
 
@@ -295,13 +296,31 @@ class Trainer:
                     aux_focal_cfg.get("alpha", 0.25),
                 )
 
-        self.best_metric: float = float("-inf")  # tracks best full AUC
+        self.best_metric: float = float("-inf")  # tracks best full AUC (kept for legacy compatibility)
         self.global_step = 0
 
         # Health metrics logging (disabled by default for backward compatibility)
         self.log_health_metrics = bool(runtime_cfg.get("log_health_metrics", False))
         if self.log_health_metrics:
             self.logger.info("Health metrics logging enabled (log_health_metrics=true)")
+
+        # ===== Best model selection strategy (gate or legacy auc_primary) =====
+        best_selection_cfg = runtime_cfg.get("best_selection", {})
+        strategy = best_selection_cfg.get("strategy", "auc_primary")
+        self.best_selector = BestSelector(
+            strategy=strategy,
+            primary_key=best_selection_cfg.get("primary_key", "auc_ctcvr"),
+            aux_keys=best_selection_cfg.get("aux_keys", ["auc_ctr", "auc_cvr"]),
+            use_primary_ma=best_selection_cfg.get("use_primary_ma", False),
+            ma_window=best_selection_cfg.get("ma_window", 5),
+            tol_primary=best_selection_cfg.get("tol_primary", 0.0),
+            tol_aux=best_selection_cfg.get("tol_aux", {}),
+            confirm_times=best_selection_cfg.get("confirm_times", 1),
+            cooldown_evals=best_selection_cfg.get("cooldown_evals", 0),
+            log_decision=best_selection_cfg.get("log_decision", True),
+            logger=self.logger,
+        )
+        self.logger.info(f"BestSelector initialized: strategy={strategy}")
 
         resume_path = cfg.get("runtime", {}).get("resume_path")
         if resume_path:
@@ -313,6 +332,10 @@ class Trainer:
             if "lr_scheduler" in extra and self.lr_scheduler_bundle.enabled:
                 self.lr_scheduler_bundle.load_state_dict(extra.get("lr_scheduler"))
                 self.logger.info("Restored lr_scheduler state from checkpoint")
+            # Restore best_selector state if present
+            if "best_selector" in extra:
+                self.best_selector.load_state(extra["best_selector"])
+                self.logger.info("Restored best_selector state from checkpoint")
             self.logger.info(f"Resumed from {resume_path}, step={self.global_step}, best_metric={self.best_metric}")
 
     def _write_metrics(self, metrics: Dict[str, Any]) -> None:
@@ -359,12 +382,31 @@ class Trainer:
             def _on_eval(val_metrics: Dict[str, Any], g_step: int, ep: int) -> None:
                 record = {"epoch": ep, "split": "valid", "global_step": g_step, **val_metrics}
                 self._write_metrics(record)
-                full_auc = val_metrics.get("auc_primary")
-                if full_auc is not None and full_auc > self.best_metric:
-                    self.best_metric = full_auc
+                
+                # Use BestSelector to determine whether to update best checkpoint
+                should_update, decision_info = self.best_selector.should_update_best(val_metrics, g_step)
+                
+                # Log decision info to metrics.jsonl for analysis
+                decision_record = {
+                    "epoch": ep,
+                    "split": "valid_decision",
+                    "global_step": g_step,
+                    **decision_info,
+                }
+                self._write_metrics(decision_record)
+                
+                if should_update:
+                    # Update legacy best_metric for backward compatibility (auc_primary)
+                    full_auc = val_metrics.get("auc_primary")
+                    if full_auc is not None:
+                        self.best_metric = full_auc
+                    
                     eval_extra = {"epoch": ep, "kind": "full"}
                     if self.lr_scheduler_bundle.enabled:
                         eval_extra["lr_scheduler"] = self.lr_scheduler_bundle.state_dict()
+                    # Save best_selector state for resume support
+                    eval_extra["best_selector"] = self.best_selector.get_state()
+                    
                     save_checkpoint(
                         self.run_dir / "ckpt_best.pt",
                         self.model,
@@ -374,7 +416,8 @@ class Trainer:
                         best_metric=self.best_metric,
                         extra=eval_extra,
                     )
-                    self.logger.info(f"New best at step {g_step}: auc={self.best_metric:.4f}")
+                    # Best selector already logged detailed info, so keep this simple
+                    self.logger.info(f"✓ Saved best checkpoint at step {g_step}")
 
             # Resolve gradient diagnostics parameters
             grad_diag_every = runtime.get("grad_diag_every")  # None means use log_every

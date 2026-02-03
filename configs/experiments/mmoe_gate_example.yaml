@@ -1,0 +1,212 @@
+# ============================================================================
+# Example configuration for Gate-based best model selection
+# ============================================================================
+# This config demonstrates the new "gate" strategy for best checkpoint selection.
+# 
+# Gate strategy rules:
+# - Primary metric (auc_ctcvr) must improve by at least tol_primary
+# - Auxiliary metrics (auc_ctr, auc_cvr) must not degrade beyond their tolerance
+# - Optional: moving average, confirmation, cooldown period
+#
+# To use legacy behavior (auc_primary scalar), set strategy: "auc_primary"
+# ============================================================================
+
+experiment:
+  name: "mmoe_gate_example"
+
+use_esmm: true
+esmm:
+  version: "v2"
+  eps: 1.0e-8
+  lambda_ctr: 1.0
+  lambda_ctcvr: 1.0
+  lambda_cvr_aux: 0.1
+
+data:
+  metadata_path: "data/processed/metadata.json"
+  batch_size: 1024
+  num_workers: 6
+  num_workers_valid: 2
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: false
+  drop_last: false
+  debug: false
+  seed: 20260127
+  neg_keep_prob_train: 1.0
+
+sampling:
+  negative_sampling: "none"
+
+embedding:
+  default_embedding_dim: 8
+  embedding_dim_overrides: {}
+  mode: "sum"
+  sparse_grad: true
+
+model:
+  name: "deepfm_mmoe"
+  mtl: "mmoe"
+  enabled_heads: ["ctr", "cvr"]
+  tasks: ["ctr", "cvr"]
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      ctr: { use_wide: true, use_fm: true }
+      cvr: { use_wide: false, use_fm: false }
+    deep_hidden_dims: [128, 64]
+    deep_dropout: 0.2
+    deep_activation: relu
+    deep_use_bn: false
+    fm_enabled: true
+    fm_projection_dim: 16
+    out_dim: 64
+  mmoe:
+    num_experts: 4
+    expert_mlp_dims: [128]
+    gate_type: "linear"
+    gate_hidden_dims: []
+    input: "deep_h"
+    dropout: 0.2
+    log_gates: true
+    gate_stabilize:
+      enabled: true
+      temperature: 1.3
+      noise_std: 0.05
+      eps: 1.0e-8
+      entropy_reg_weight: 2.0e-3
+      load_balance_kl_weight: 2.0e-3
+      log_stats: true
+    add_fm_vec: true
+    add_emb: "mean"
+    part_proj_dim: 128
+    fusion: "concat"
+    adapter_mlp_dims: [128]
+    norm: "layernorm"
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    ctr: {}
+    cvr: {}
+  deep_hidden_dims: [256, 128]
+  deep_dropout: 0.2
+  deep_activation: "relu"
+  deep_use_bn: false
+  fm_enabled: true
+  fm_projection_dim: 16
+  out_dim: 128
+
+optim:
+  type: dual_sparse_dense
+  dense:
+    lr: 0.0006
+    weight_decay: 1e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  sparse:
+    enabled: true
+    lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    allow_fallback_if_empty: false
+  lr_scheduler:
+    enabled: true
+    target: "both"
+    type: "cosine"
+    warmup_steps: 5000
+    total_steps: 40000
+    min_lr_ratio: 0.1
+
+loss:
+  w_ctr: 1.0
+  w_cvr: 1.0
+  eps: 1.0e-6
+  pos_weight_dynamic: false
+  static_pos_weight:
+    ctr: 1.0
+    ctcvr: 1.0
+  pos_weight_clip:
+    ctr: 1.0
+    ctcvr: 1.0
+  pos_weight_clip_schedule:
+    enabled: false
+    target: "ctcvr"
+    type: "piecewise"
+    milestones: [0, 8000]
+    values: [300, 30]
+  aux_focal:
+    enabled: false
+    warmup_steps: 8000
+    target_head: "ctcvr"
+    lambda: 0.05
+    gamma: 1.0
+    use_alpha: false
+    alpha: 0.25
+    detach_p_for_weight: true
+    compute_fp32: true
+    log_components: true
+
+runtime:
+  device: "cuda"
+  epochs: 1
+  log_every: 5000
+  amp: true
+  grad_diag_enabled: true
+  grad_diag_every: 10000
+  grad_diag_min_tasks: 2
+  log_health_metrics: true
+  max_train_steps: 40000
+  max_valid_steps: null
+  grad_clip_norm: 2.0
+  seed: 20260127
+  resume_path: null
+  auto_eval: true
+  auto_eval_split: "valid"
+  auto_eval_save_preds: true
+  auto_eval_ckpt: "best"
+  save_last: false
+  
+  # ============================================================================
+  # Best model selection strategy (NEW FEATURE)
+  # ============================================================================
+  best_selection:
+    # Strategy: "auc_primary" (legacy, default) or "gate" (new)
+    strategy: "gate"
+    
+    # Primary metric key (must improve for best update)
+    primary_key: "auc_ctcvr"
+    
+    # Auxiliary metric keys (must not degrade)
+    aux_keys: ["auc_ctr", "auc_cvr"]
+    
+    # Use moving average for primary metric (reduces spike sensitivity)
+    use_primary_ma: true
+    ma_window: 5
+    
+    # Tolerance: primary must improve by at least this amount
+    tol_primary: 0.002  # e.g., 0.002 = 0.2% absolute improvement required
+    
+    # Tolerance: aux metrics can degrade by at most these amounts
+    tol_aux:
+      auc_ctr: 0.003   # e.g., 0.003 = 0.3% absolute degradation allowed
+      auc_cvr: 0.008   # e.g., 0.008 = 0.8% absolute degradation allowed
+    
+    # Confirmation: require consecutive gate passes before updating best
+    confirm_times: 2  # Set to 1 to disable confirmation
+    
+    # Cooldown: skip this many evals after updating best (prevents oscillation)
+    cooldown_evals: 1  # Set to 0 to disable cooldown
+    
+    # Log decision details (reason for update/skip)
+    log_decision: true
+  
+  # ============================================================================
+  # For legacy behavior (simple auc_primary comparison), use:
+  # ============================================================================
+  # best_selection:
+  #   strategy: "auc_primary"
+  #   log_decision: true

@@ -9,6 +9,7 @@ import torch.nn as nn
 from src.models.backbones.deepfm import DeepFMBackbone
 from src.models.mtl.shared_bottom import SharedBottom
 from src.models.mtl.mmoe import MMoE
+from src.models.mtl.ple import PLE
 from src.utils.config import load_yaml
 
 try:
@@ -138,7 +139,24 @@ def build_model(cfg: Dict[str, Any], feature_map: Dict[str, Any] | None = None, 
             log_gates=log_gates,
         )
 
-    raise ValueError(f"Unsupported model.mtl '{mtl}'. Expected 'sharedbottom' or 'mmoe'.")
+    # ========== PLE-Lite 分支 ==========
+    # 与 MMoE 同级，作为对照组实验模型
+    if mtl == "ple":
+        ple_cfg = model_cfg.get("ple", {})
+        log_gates = bool(ple_cfg.get("log_gates", False))
+        return PLE(
+            backbone=backbone,
+            head_cfg=head_cfg,
+            ple_cfg=ple_cfg,
+            enabled_heads=enabled_heads,
+            use_legacy_pseudo_deepfm=use_legacy,
+            return_logit_parts=return_parts,
+            per_head_add=per_head_add,
+            head_priors=label_priors,
+            log_gates=log_gates,
+        )
+
+    raise ValueError(f"Unsupported model.mtl '{mtl}'. Expected 'sharedbottom', 'mmoe', or 'ple'.")
 
 
 __all__ = ["build_model"]

@@ -1,5 +1,5 @@
 experiment:
-  name: "deepfm_mmoe_dual_sparse"
+  name: "abl1_a3_focal_only"
 
 # ESMM toggle (default off to preserve legacy behaviour)
 use_esmm: true
@@ -15,13 +15,13 @@ data:
   batch_size: 1024
   num_workers: 6
   num_workers_valid: 2  # Use fewer workers for validation
-  prefetch_factor: 4
+  prefetch_factor: 2
   pin_memory: true
   persistent_workers: true
   drop_last: false
   debug: false
   seed: 20260127
-  neg_keep_prob_train: 0.4
+  neg_keep_prob_train: 1.0
 
 sampling:
   negative_sampling: "none"  # set to "none" when use_esmm=true
@@ -122,16 +122,16 @@ loss:
   eps: 1.0e-6
   pos_weight_dynamic: false
   static_pos_weight:
-    ctr: 24.7          #24.7
-    ctcvr: 4800           #4800
+    ctr: 1.0          #24.7
+    ctcvr: 1.0           #4800
   pos_weight_clip:
-    ctr: 30
-    ctcvr: 300
+    ctr: 1.0
+    ctcvr: 1.0
   # ============================================================
   # 改动 B: pos_weight_clip 调度配置
   # ============================================================
   pos_weight_clip_schedule:
-    enabled: true
+    enabled: false
     target: "ctcvr"          # "ctcvr" | "ctr" | "both"
     type: "piecewise"        # "piecewise" 分段 | "linear" 线性
     # piecewise 方案：按里程碑切换
@@ -172,7 +172,7 @@ runtime:
   log_every: 5000
   amp: true
   grad_diag_enabled: true  # Enable new dynamic gradient diagnostics
-  grad_diag_every: 1000    # Run at same frequency as logging (null = use log_every)
+  grad_diag_every: 10000    # Run at same frequency as logging (null = use log_every)
   grad_diag_min_tasks: 2   # Minimum tasks for shared param identification
   log_health_metrics: true  # Enable health metrics logging
   max_train_steps: 40000

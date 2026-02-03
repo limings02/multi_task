@@ -1,0 +1,254 @@
+experiment:
+  name: "deepfm_ple_lite_dual_sparse"
+
+# ESMM toggle（与 mmoe 保持一致）
+use_esmm: true
+esmm:
+  version: "v2"  # "v2" (standard ESMM: p_ctcvr = p_ctr * p_cvr) or "legacy" (deprecated)
+  eps: 1.0e-8
+  lambda_ctr: 1.0
+  lambda_ctcvr: 1.0
+  lambda_cvr_aux: 0.1  # CVR auxiliary loss on click=1 subset; 0 to disable
+
+data:
+  metadata_path: "data/processed/metadata.json"
+  batch_size: 1024
+  num_workers: 6
+  num_workers_valid: 2  # Use fewer workers for validation
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: false
+  drop_last: false
+  debug: false
+  seed: 20260127
+  neg_keep_prob_train: 1.0
+
+sampling:
+  negative_sampling: "none"  # set to "none" when use_esmm=true
+
+embedding:
+  default_embedding_dim: 8
+  embedding_dim_overrides: {}
+  mode: "sum"
+  sparse_grad: true
+
+model:
+  name: "deepfm_ple"
+  mtl: "ple"  # 关键改动：从 mmoe 切换为 ple
+  enabled_heads: ["ctr", "cvr"]
+  tasks: ["ctr", "cvr"]
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      ctr: { use_wide: true, use_fm: true }
+      cvr: { use_wide: false, use_fm: false }
+    deep_hidden_dims: [128, 64]
+    deep_dropout: 0.2
+    deep_activation: relu
+    deep_use_bn: false
+    fm_enabled: true
+    fm_projection_dim: 16
+    out_dim: 64
+  
+  # ========== PLE-Lite 专属配置 ==========
+  ple:
+    # ---------- Expert 配置 ----------
+    # shared experts: 所有任务共享（与 mmoe num_experts 保持一致便于对比）
+    shared_num_experts: 4
+    # specific experts: 每个任务专属
+    specific_num_experts:
+      ctr: 1
+      cvr: 1
+    # expert MLP 配置（与 mmoe 的 expert_mlp_dims 完全对齐）
+    expert_mlp_dims: [128]
+    # private expert 可选使用更小容量（任务3：降低 private 容量，避免吞噬 shared）
+    # 如果不填写或为空：保持与 shared 相同（向后兼容）
+    # 示例：private_expert_mlp_dims: [64]  # 比 shared 更窄
+    # private_expert_mlp_dims: []
+    dropout: 0.2
+    activation: relu
+    use_bn: false
+
+    # ---------- Gate 配置 ----------
+    gate_type: "linear"  # linear | mlp
+    gate_hidden_dims: []
+    log_gates: true  # Enable gate weight logging for health metrics
+
+    # ---------- Gate 稳定化配置（与 mmoe 完全对齐）----------
+    gate_stabilize:
+      enabled: true
+      eps: 1.0e-8
+      entropy_reg_weight: 2.0e-3      # 熵正则：鼓励更均匀的路由
+      load_balance_kl_weight: 2.0e-3  # 负载均衡 KL 正则
+      log_stats: true
+      # ---------- Temperature/Noise 退火 Schedule（任务4：可选）----------
+      # 支持线性退火：在 warmup 期间保持 start 值，然后线性衰减到 end 值
+      # enabled=false 时完全不生效（向后兼容）
+      schedule:
+        enabled: true  # 默认关闭
+        warm_frac: 0.2  # warmup 占总步数的比例，在此期间保持 start 值
+        temperature_start: 1.5  # 初始温度（较高更平滑）
+        temperature_end: 1.0    # 最终温度
+        noise_std_start: 0.05   # 初始噪声标准差
+        noise_std_end: 0.0      # 最终噪声（训练后期关闭噪声）
+
+    # ---------- PLE 新增配置：gate_reg_scope ----------
+    # 控制 gate 正则化的范围
+    # "shared_only"（默认）：只对 shared experts 的 gate 权重做 entropy/kl 正则
+    #   - 先切片取 shared 部分，再归一化到和为 1，然后计算正则
+    #   - 好处：不干扰 task-specific experts 的学习，各任务正则可比
+    # "all"：对全部 experts 的 gate 权重做正则
+    gate_reg_scope: "shared_only"
+
+    # ---------- Shared Mass Floor 配置（新增：防止 private 吞噬 shared）----------
+    # 强制每个 task 的 gate 保留一定比例流量走 shared experts
+    # 当 enabled=false 或配置缺失时完全不生效（向后兼容）
+    gate_shared_mass_floor:
+      enabled: false  # 默认关闭，保证旧实验可复现
+      # per_task: 每个 task 可配置不同的 min_mass 和 weight
+      # task 名称必须与 model.tasks (ctr/cvr) 一致
+      per_task:
+        ctr:
+          min_mass: 0.4    # shared experts 的 gate 权重总和下限
+          weight: 1.0e-3   # 惩罚系数：loss += weight * relu(min_mass - mass)^2
+        cvr:
+          min_mass: 0.2    # CVR 任务可设置较低的 min_mass
+          weight: 5.0e-4
+
+    # ---------- Input Composer 配置（与 mmoe 对齐）----------
+    input: "deep_h"
+    add_fm_vec: true       # 是否加入 fm_vec（FM 二阶向量）
+    add_emb: "mean"        # embedding 聚合方式: none|sum|mean|concat
+    part_proj_dim: 128     # 每个 part 投影到的统一维度
+    fusion: "concat"       # 融合方式: concat|sum
+    adapter_mlp_dims: [128]  # 融合后可选 MLP 层维度
+    norm: "layernorm"      # 各 part 投影后的归一化
+
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    ctr: {}
+    cvr: {}
+  
+  deep_hidden_dims: [256, 128]
+  deep_dropout: 0.2
+  deep_activation: "relu"
+  deep_use_bn: false
+  fm_enabled: true
+  fm_projection_dim: 16
+  out_dim: 128
+
+optim:
+  type: dual_sparse_dense
+  dense:
+    lr: 0.0006
+    weight_decay: 1e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  sparse:
+    enabled: true
+    lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    allow_fallback_if_empty: false
+  # ============================================================
+  # 学习率调度配置（与 mmoe 保持一致）
+  # ============================================================
+  lr_scheduler:
+    enabled: true
+    target: "both"         # "dense" 只调度 dense optimizer | "both" 同时调度
+    type: "cosine"          # "cosine" 余弦退火 | "step" 阶梯衰减
+    warmup_steps: 5000       # warmup 步数
+    total_steps: 40000       # 总步数
+    min_lr_ratio: 0.1        # cosine 最小 lr = base_lr * min_lr_ratio
+
+loss:
+  w_ctr: 1.0
+  w_cvr: 1.0
+  eps: 1.0e-6
+  pos_weight_dynamic: false
+  static_pos_weight:
+    ctr: 1
+    ctcvr: 1
+  pos_weight_clip:
+    ctr: 30
+    ctcvr: 300
+  # ============================================================
+  # pos_weight_clip 调度配置（与 mmoe 保持一致）
+  # ============================================================
+  pos_weight_clip_schedule:
+    enabled: false
+    target: "ctcvr"          # "ctcvr" | "ctr" | "both"
+    type: "piecewise"        # "piecewise" 分段 | "linear" 线性
+    milestones: [0, 8000]     # step 边界
+    values: [300, 30]        # 对应的 clip 值
+
+  # ===== ESMM 主链路 BCE + CTCVR Aux-Focal（与 mmoe 保持一致）=====
+  aux_focal:
+    enabled: false
+    warmup_steps: 8000
+    target_head: "ctcvr"
+    lambda: 0.05
+    gamma: 1.0
+    use_alpha: false
+    alpha: 0.25
+    detach_p_for_weight: true
+    compute_fp32: true
+    log_components: true
+
+runtime:
+  device: "cuda"
+  epochs: 1
+  log_every: 5000
+  amp: true
+  grad_diag_enabled: true  # Enable new dynamic gradient diagnostics
+  grad_diag_every: 1000    # Run at same frequency as logging
+  grad_diag_min_tasks: 2   # Minimum tasks for shared param identification
+  log_health_metrics: true  # Enable health metrics logging
+  max_train_steps: null
+  max_valid_steps: null
+  grad_clip_norm: 2.0
+  seed: 20260127
+  resume_path: null
+  auto_eval: true
+  auto_eval_split: "valid"
+  auto_eval_save_preds: true
+  auto_eval_ckpt: "best"
+  save_last: false
+  # ============================================================================
+  # Best model selection strategy (NEW FEATURE)
+  # ============================================================================
+  best_selection:
+    # Strategy: "auc_primary" (legacy, default) or "gate" (new)
+    strategy: "gate"
+    
+    # Primary metric key (must improve for best update)
+    primary_key: "auc_ctcvr"
+    
+    # Auxiliary metric keys (must not degrade)
+    aux_keys: ["auc_ctr", "auc_cvr"]
+    
+    # Use moving average for primary metric (reduces spike sensitivity)
+    use_primary_ma: true
+    ma_window: 5
+    
+    # Tolerance: primary must improve by at least this amount
+    tol_primary: 0.002  # e.g., 0.002 = 0.2% absolute improvement required
+    
+    # Tolerance: aux metrics can degrade by at most these amounts
+    tol_aux:
+      auc_ctr: 0.003   # e.g., 0.003 = 0.3% absolute degradation allowed
+      auc_cvr: 0.008   # e.g., 0.008 = 0.8% absolute degradation allowed
+    
+    # Confirmation: require consecutive gate passes before updating best
+    confirm_times: 1  # Set to 1 to disable confirmation
+    
+    # Cooldown: skip this many evals after updating best (prevents oscillation)
+    cooldown_evals: 1  # Set to 0 to disable cooldown
+    
+    # Log decision details (reason for update/skip)
+    log_decision: true

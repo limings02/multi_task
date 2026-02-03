@@ -1,0 +1,156 @@
+# PLE-Lite 模型配置
+# 基于 mtl_mmoe.yaml 模板，切换 MTL block 为 PLE
+# 用于对照实验：PLE vs MMoE ablation study
+
+experiment:
+  name: "deepfm_ple_lite"
+
+# ESMM toggle（与 mmoe 保持一致）
+use_esmm: true
+esmm:
+  version: "v2"  # "v2" (standard ESMM: p_ctcvr = p_ctr * p_cvr) or "legacy" (deprecated)
+  eps: 1.0e-8
+  lambda_ctr: 1.0
+  lambda_ctcvr: 1.0
+  lambda_cvr_aux: 0.1  # CVR auxiliary loss on click=1 subset; 0 to disable
+
+data:
+  metadata_path: "data/processed/metadata.json"
+  batch_size: 1024
+  num_workers: 6
+  num_workers_valid: 2
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+  debug: false
+  seed: 20260127
+  neg_keep_prob_train: 0.4
+
+sampling:
+  negative_sampling: "none"  # set to "none" when use_esmm=true
+
+embedding:
+  default_embedding_dim: 8
+  embedding_dim_overrides: {}
+  mode: "sum"
+  sparse_grad: true
+
+model:
+  name: "deepfm_ple"
+  mtl: "ple"  # 关键改动：从 mmoe 切换为 ple
+  enabled_heads: ["ctr", "cvr"]
+  tasks: ["ctr", "cvr"]
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      ctr: { use_wide: true, use_fm: true }
+      cvr: { use_wide: false, use_fm: false }
+    deep_hidden_dims: [128, 64]
+    deep_dropout: 0.2
+    deep_activation: relu
+    deep_use_bn: false
+    fm_enabled: true
+    fm_projection_dim: 16
+    out_dim: 64
+  
+  # ========== PLE 专属配置 ==========
+  ple:
+    # ---------- Expert 配置 ----------
+    # shared experts: 所有任务共享
+    shared_num_experts: 4
+    # specific experts: 每个任务专属（可以相同或不同）
+    specific_num_experts:
+      ctr: 1
+      cvr: 1
+    # expert MLP 配置（与 mmoe 的 expert_mlp_dims 对齐）
+    expert_mlp_dims: [128]
+    dropout: 0.2
+    activation: relu
+    use_bn: false
+
+    # ---------- Gate 配置 ----------
+    gate_type: "linear"  # linear | mlp
+    gate_hidden_dims: []  # 仅当 gate_type=mlp 时有效
+    log_gates: true  # 启用 gate 权重日志（用于 health metrics）
+
+    # ---------- Gate 稳定化配置（与 mmoe 完全对齐）----------
+    gate_stabilize:
+      enabled: true
+      temperature: 1.2          # >1 使 softmax 更平滑，避免路由锁死
+      noise_std: 0.05           # gate logits 加高斯噪声（仅训练时）
+      eps: 1.0e-8
+      entropy_reg_weight: 1.0e-3      # 熵正则：鼓励更均匀的路由
+      load_balance_kl_weight: 1.0e-3  # 负载均衡 KL 正则
+      log_stats: true
+
+    # ---------- PLE 新增配置：gate_reg_scope ----------
+    # 控制 gate 正则化的范围
+    # "shared_only"（默认）：只对 shared experts 的 gate 权重做 entropy/kl 正则
+    #   - 先切片取 shared 部分，再归一化到和为 1，然后计算正则
+    #   - 好处：不干扰 task-specific experts 的学习，各任务正则可比
+    # "all"：对全部 experts 的 gate 权重做正则
+    gate_reg_scope: "shared_only"
+
+    # ---------- Input Composer 配置（可选，与 mmoe 对齐）----------
+    input: "deep_h"  # 基础输入源
+    add_fm_vec: true       # 是否加入 fm_vec（FM 二阶向量）
+    add_emb: "mean"        # embedding 聚合方式: none|sum|mean|concat
+    part_proj_dim: 128     # 每个 part 投影到的统一维度
+    fusion: "concat"       # 融合方式: concat|sum
+    adapter_mlp_dims: [128]  # 融合后可选 MLP 层维度
+    norm: "layernorm"      # 各 part 投影后的归一化
+
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    ctr: {}
+    cvr: {}
+  
+  # backbone 默认配置（fallback）
+  deep_hidden_dims: [256, 128]
+  deep_dropout: 0.2
+  deep_activation: "relu"
+  deep_use_bn: false
+  fm_enabled: true
+  fm_projection_dim: 16
+  out_dim: 128
+
+optim:
+  type: dual_sparse_dense
+  dense:
+    lr: 0.0006
+    weight_decay: 1e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  sparse:
+    enabled: true
+    lr: 0.002
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    allow_fallback_if_empty: false
+
+loss:
+  w_ctr: 1.0
+  w_cvr: 1.0
+  eps: 1.0e-6
+  # gate 正则化权重（由 model.ple.gate_stabilize 中配置，此处无需重复）
+
+runtime:
+  device: "cuda"
+  epochs: 3
+  log_every: 100
+  amp: true
+  grad_diag_enabled: false
+  grad_clip_norm: 1.0
+  seed: 20260127
+  resume_path: null
+  auto_eval: true
+  auto_eval_split: "valid"
+  auto_eval_save_preds: false
+  auto_eval_ckpt: "best"
+  save_last: true

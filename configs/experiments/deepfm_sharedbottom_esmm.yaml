@@ -1,5 +1,5 @@
 experiment:
-  name: "deepfm_mmoe_dual_sparse"
+  name: "deepfm_shared_bottom_esmm"
 
 # ESMM toggle (default off to preserve legacy behaviour)
 use_esmm: true
@@ -33,8 +33,8 @@ embedding:
   sparse_grad: true
 
 model:
-  name: "deepfm_mmoe"
-  mtl: "mmoe"
+  name: "deepfm_shared_bottom_ctr_cvr"
+  mtl: "sharedbottom"
   enabled_heads: ["ctr", "cvr"]
   tasks: ["ctr", "cvr"]
   backbone:
@@ -50,32 +50,9 @@ model:
     fm_enabled: true
     fm_projection_dim: 16
     out_dim: 64
-  mmoe:
-    num_experts: 4
-    expert_mlp_dims: [128]
-    gate_type: "linear"
-    gate_hidden_dims: []
-    input: "deep_h"
-    dropout: 0.2
-    log_gates: true  # Enable gate weight logging for health metrics
-    gate_stabilize:
-      enabled: true
-      temperature: 1.2          # >1 更平滑，避免路由锁死
-      noise_std: 0.05           # gate logits 加高斯噪声（仅训练时）
-      eps: 1.0e-8
-      entropy_reg_weight: 1.0e-3      # 熵正则：鼓励更均匀的路由
-      load_balance_kl_weight: 1.0e-3  # 负载均衡KL正则
-      log_stats: true
-    # ===== 新增字段 =====
-    add_fm_vec: true       # 是否加入 fm_vec（FM 二阶向量）
-    add_emb: "mean"         # embedding 聚合方式: none|sum|mean|concat
-    part_proj_dim: 128      # 每个 part 投影到的统一维度；null 表示保留原维度
-    fusion: "concat"        # 融合方式: concat|sum
-    adapter_mlp_dims: [128]    # 融合后可选 MLP 层维度
-    norm: "layernorm"            # 各 part 投影后的归一化: none|layernorm
   heads:
     default:
-      mlp_dims: [128]
+      mlp_dims: [256, 128]  # 增加容量以对齐 MMoE 参数量
       dropout: 0.1
       use_bn: false
       activation: "relu"

@@ -1,5 +1,5 @@
 experiment:
-  name: "deepfm_mmoe_dual_sparse"
+  name: "abl1_a2_posw_only"
 
 # ESMM toggle (default off to preserve legacy behaviour)
 use_esmm: true
@@ -15,13 +15,13 @@ data:
   batch_size: 1024
   num_workers: 6
   num_workers_valid: 2  # Use fewer workers for validation
-  prefetch_factor: 4
+  prefetch_factor: 2
   pin_memory: true
   persistent_workers: true
   drop_last: false
   debug: false
   seed: 20260127
-  neg_keep_prob_train: 0.4
+  neg_keep_prob_train: 1.0
 
 sampling:
   negative_sampling: "none"  # set to "none" when use_esmm=true
@@ -155,7 +155,7 @@ loss:
   #   - gamma: 1.0, 2.0
   #   - warmup_steps: 1000, 2000
   aux_focal:
-    enabled: true              # 开关：true 启用，false 禁用（默认禁用以保持向后兼容）
+    enabled: false              # 开关：true 启用，false 禁用（默认禁用以保持向后兼容）
     warmup_steps: 8000         # warmup 步数：前 N step 不启用 aux focal
     target_head: "ctcvr"       # 目标 head（固定为 ctcvr，不要改为 ctr）
     lambda: 0.05                # focal 辅助项系数（推荐 sweep: 0.05/0.1/0.2）
@@ -172,7 +172,7 @@ runtime:
   log_every: 5000
   amp: true
   grad_diag_enabled: true  # Enable new dynamic gradient diagnostics
-  grad_diag_every: 1000    # Run at same frequency as logging (null = use log_every)
+  grad_diag_every: 10000    # Run at same frequency as logging (null = use log_every)
   grad_diag_min_tasks: 2   # Minimum tasks for shared param identification
   log_health_metrics: true  # Enable health metrics logging
   max_train_steps: 40000

@@ -169,14 +169,14 @@ loss:
 runtime:
   device: "cuda"
   epochs: 1
-  log_every: 5000
+  log_every: 50
   amp: true
   grad_diag_enabled: true  # Enable new dynamic gradient diagnostics
-  grad_diag_every: 1000    # Run at same frequency as logging (null = use log_every)
+  grad_diag_every: 50    # Run at same frequency as logging (null = use log_every)
   grad_diag_min_tasks: 2   # Minimum tasks for shared param identification
   log_health_metrics: true  # Enable health metrics logging
-  max_train_steps: 40000
-  max_valid_steps: null
+  max_train_steps: 200
+  max_valid_steps: 100
   grad_clip_norm: 2.0
   seed: 20260127
   resume_path: null

@@ -175,7 +175,7 @@ python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_tr
 - 若未安装 sklearn，AUC 字段为 null，程序不会报错 )```
 
 ```bash
-python -m src.cli.main eval --config runs/deepfm_mmoe_dual_sparse_20260201_193155/config.yaml --ckpt runs/deepfm_mmoe_dual_sparse_20260201_193155/ckpt_best.pt --split valid
+python -m src.cli.main eval --config runs/deepfm_ple_lite_dual_sparse_20260203_123206/config.yaml --ckpt runs/deepfm_ple_lite_dual_sparse_20260203_123206/ckpt_best.pt --split valid
 ```
 
 ## MMoE
@@ -188,3 +188,38 @@ python -m src.cli.main train --config configs/experiments/mtl_mmoe.yaml
 - 优化器框架升级为 OptimizerBundle，支持 `optim.type = single | dual_sparse_dense`，可选稀疏优化器（SparseAdam）；旧配置与旧 ckpt 仍兼容。
 - 支持稀疏梯度：在 `embedding.sparse_grad=true` 时 EmbeddingBag 使用稀疏权重并由 SparseAdam 更新；未开启时保持原有 dense 行为。
 - 重要护栏：`optim.sparse.enabled=true` 且未找到稀疏参数会报错，除非 `allow_fallback_if_empty=true` 才降级为 dense；日志会输出稀疏/稠密参数统计与加载的优化器类型。
+
+## PLE-Lite（方案1：消融对照组）
+
+PLE-Lite（Progressive Layered Extraction Lite）新增实现，作为 MMoE 的对照组消融模型。
+
+### 核心改动
+- **新增文件**：`src/models/mtl/ple.py` - PLE-Lite 模型实现
+  - Shared Experts：所有任务共享（默认 4 个）
+  - Task-Specific Experts：每个任务专属（默认每任务 1 个）
+  - 每个 task 的 gate 只在 (shared + 本任务 specific) experts 上做 softmax
+  
+- **新增配置**：`configs/model/mtl_ple.yaml` 和 `configs/experiments/mtl_ple.yaml`
+  - 完全对标 MMoE 配置，确保公平对比
+  - 新增参数 `gate_reg_scope`：控制正则化范围
+    - `"shared_only"`（默认）：只对 shared experts 的 gate 权重做 entropy/kl 正则
+    - `"all"`：对全部 experts 做正则
+
+- **build.py 新增分支**：`mtl="ple"` 时自动构建 PLE 模型
+
+- **测试用例**：`tests/test_model_forward.py::test_model_forward_ple`
+  - 验证 forward 输出格式、gate_reg_loss 有效性、梯度反传
+
+### 运行消融实验
+```bash
+# PLE-Lite 训练
+python -m src.cli.main train --config configs/experiments/mtl_ple_lite.yaml
+
+# 对标 MMoE
+python -m src.cli.main train --config configs/experiments/mtl_mmoe.yaml
+```
+
+### 设计特点
+- **共享 vs 专属路由**：通过 gate_reg_scope="shared_only" 只约束 shared experts 的路由均匀性，避免过度正则化 task-specific 专家
+- **最小侵入**：复用 MMoE 的 gate 稳定化、composer、TaskHead 等接口，仅改变 expert 组织结构
+- **可复现性**：与 MMoE 共享 ESMM/Loss/Metrics/Optimizer 完整体系
