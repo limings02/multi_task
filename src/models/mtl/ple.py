@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import torch
 from torch import nn
@@ -29,6 +29,87 @@ from src.models.heads import TaskHead
 from src.models.mtl.composer import MMoEInputComposer, build_composer_from_config
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Heterogeneous Expert Support (向前兼容扩展)
+# =============================================================================
+def _should_use_hetero_experts(ple_cfg: Dict) -> bool:
+    """
+    判断是否应该使用异构专家（新逻辑）。
+    
+    向前兼容策略：
+      1. 如果 hetero_enabled 显式设置为 False：走旧逻辑
+      2. 如果 experts 配置缺失或为空：走旧逻辑
+      3. 如果 experts.shared 不存在或为空：走旧逻辑
+      4. 否则：走异构专家逻辑
+    
+    Args:
+        ple_cfg: PLE 配置字典
+        
+    Returns:
+        True if should use heterogeneous experts, False for legacy homogeneous experts
+    """
+    # 显式开关：hetero_enabled=False 强制走旧逻辑（便于快速回退）
+    hetero_enabled = ple_cfg.get("hetero_enabled")
+    if hetero_enabled is False:
+        return False
+    
+    # 检查 experts 配置是否存在且有效
+    experts_cfg = ple_cfg.get("experts")
+    if not experts_cfg:
+        return False
+    
+    # 检查 shared experts 是否存在且非空
+    shared_specs = experts_cfg.get("shared")
+    if not shared_specs or not isinstance(shared_specs, list) or len(shared_specs) == 0:
+        return False
+    
+    return True
+
+
+def _validate_hetero_config(ple_cfg: Dict, tasks: List[str]) -> None:
+    """
+    校验异构专家配置的有效性。
+    
+    检查项：
+      - experts.shared 必须存在且非空
+      - len(experts.shared) 必须等于 shared_num_experts（如果指定）
+      - 所有 expert spec 必须包含 type 字段
+      
+    Args:
+        ple_cfg: PLE 配置字典
+        tasks: 任务名称列表
+        
+    Raises:
+        ValueError: 如果配置无效
+    """
+    experts_cfg = ple_cfg.get("experts", {})
+    
+    # 校验 shared experts
+    shared_specs = experts_cfg.get("shared", [])
+    if not shared_specs:
+        raise ValueError("Heterogeneous experts enabled but experts.shared is empty")
+    
+    # 校验 shared_num_experts 一致性
+    num_shared_config = ple_cfg.get("shared_num_experts")
+    if num_shared_config is not None and len(shared_specs) != int(num_shared_config):
+        raise ValueError(
+            f"len(experts.shared)={len(shared_specs)} != shared_num_experts={num_shared_config}"
+        )
+    
+    # 校验每个 expert spec 包含 type
+    for i, spec in enumerate(shared_specs):
+        if not isinstance(spec, dict) or "type" not in spec:
+            raise ValueError(f"experts.shared[{i}] must be a dict with 'type' field, got {spec}")
+    
+    # 校验 private experts（如果存在）
+    private_cfg = experts_cfg.get("private", {})
+    for task in tasks:
+        task_specs = private_cfg.get(task, [])
+        for i, spec in enumerate(task_specs):
+            if not isinstance(spec, dict) or "type" not in spec:
+                raise ValueError(f"experts.private.{task}[{i}] must be a dict with 'type' field")
 
 
 class _GatePLE(nn.Module):
@@ -184,72 +265,18 @@ class PLE(nn.Module):
         self.in_dim = in_dim
         self.layernorm = nn.LayerNorm(in_dim)
 
-        # ========== PLE 专属配置：shared + specific experts 数量 ==========
-        # shared experts 数量（所有任务共享）
-        self.num_shared_experts = int(ple_cfg.get("shared_num_experts", 4))
+        # ==========================================================================
+        # 异构专家支持：检测是否启用新的异构专家逻辑
+        # ==========================================================================
+        self._use_hetero_experts = _should_use_hetero_experts(ple_cfg)
         
-        # specific experts 数量（每个任务可以不同）
-        specific_cfg = ple_cfg.get("specific_num_experts", {})
-        if isinstance(specific_cfg, int):
-            # 兼容简写：所有任务相同数量
-            self.num_specific_experts: Dict[str, int] = {task: specific_cfg for task in tasks}
+        if self._use_hetero_experts:
+            # ==================== 新路径：异构专家 ====================
+            _validate_hetero_config(ple_cfg, tasks)
+            self._build_hetero_experts(ple_cfg, tasks, in_dim)
         else:
-            # 字典形式：每个任务可配置
-            default_specific = int(specific_cfg.get("default", 1))
-            self.num_specific_experts = {
-                task: int(specific_cfg.get(task, default_specific)) for task in tasks
-            }
-
-        # expert MLP 配置
-        expert_mlp_dims = list(ple_cfg.get("expert_mlp_dims", []))
-        expert_output_dims = expert_mlp_dims + [in_dim] if expert_mlp_dims else [in_dim]
-        expert_dropout = float(ple_cfg.get("dropout", 0.0))
-        expert_activation = str(ple_cfg.get("activation", "relu"))
-        expert_use_bn = bool(ple_cfg.get("use_bn", False))
-
-        # ========== 新增：private expert 可选使用更小容量（任务3）==========
-        # 如果 private_expert_mlp_dims 存在且非空，则用于 task-specific experts
-        # 否则保持与 shared experts 相同（向后兼容）
-        private_expert_mlp_dims = ple_cfg.get("private_expert_mlp_dims")
-        if private_expert_mlp_dims:
-            private_expert_mlp_dims = list(private_expert_mlp_dims)
-            private_expert_output_dims = private_expert_mlp_dims + [in_dim] if private_expert_mlp_dims else [in_dim]
-        else:
-            private_expert_output_dims = expert_output_dims  # 与 shared 相同
-
-        logger.info(
-            f"[PLE] shared_experts={self.num_shared_experts}, "
-            f"specific_experts={self.num_specific_experts}, "
-            f"expert_mlp_dims={expert_mlp_dims}"
-            + (f", private_expert_mlp_dims={private_expert_mlp_dims}" if private_expert_mlp_dims else "")
-        )
-
-        # ========== 构建 shared experts ==========
-        self.shared_experts = nn.ModuleList([
-            MLP(
-                input_dim=in_dim,
-                hidden_dims=expert_output_dims[:-1],
-                activation=expert_activation,
-                dropout=expert_dropout,
-                use_bn=expert_use_bn,
-            )
-            for _ in range(self.num_shared_experts)
-        ])
-
-        # ========== 构建 task-specific experts ==========
-        self.specific_experts = nn.ModuleDict()
-        for task in tasks:
-            num_specific = self.num_specific_experts[task]
-            self.specific_experts[task] = nn.ModuleList([
-                MLP(
-                    input_dim=in_dim,
-                    hidden_dims=private_expert_output_dims[:-1],  # 使用 private 配置
-                    activation=expert_activation,
-                    dropout=expert_dropout,
-                    use_bn=expert_use_bn,
-                )
-                for _ in range(num_specific)
-            ])
+            # ==================== 旧路径：同构专家（完全保持原逻辑）====================
+            self._build_homogeneous_experts(ple_cfg, tasks, in_dim)
 
         # ========== Gate 稳定化配置（与 mmoe.py 完全对齐）==========
         gate_stabilize_cfg = ple_cfg.get("gate_stabilize", {}) or {}
@@ -382,6 +409,209 @@ class PLE(nn.Module):
             if self.towers[task].out_proj.bias is not None:
                 nn.init.constant_(self.towers[task].out_proj.bias, bias_init)
 
+    # =========================================================================
+    # Expert Building Methods (同构/异构专家构建)
+    # =========================================================================
+    
+    def _build_homogeneous_experts(
+        self,
+        ple_cfg: Dict[str, Any],
+        tasks: List[str],
+        in_dim: int,
+    ) -> None:
+        """
+        构建同构专家（旧逻辑，保持完全向后兼容）。
+        
+        同构专家使用统一的 MLP 配置：
+          - shared_num_experts: 共享专家数量
+          - specific_num_experts: 每个任务的专属专家数量
+          - expert_mlp_dims: MLP 隐藏层维度
+          - dropout/activation/use_bn: MLP 配置
+        """
+        # ========== PLE 专属配置：shared + specific experts 数量 ==========
+        # shared experts 数量（所有任务共享）
+        self.num_shared_experts = int(ple_cfg.get("shared_num_experts", 4))
+        
+        # specific experts 数量（每个任务可以不同）
+        specific_cfg = ple_cfg.get("specific_num_experts", {})
+        if isinstance(specific_cfg, int):
+            # 兼容简写：所有任务相同数量
+            self.num_specific_experts: Dict[str, int] = {task: specific_cfg for task in tasks}
+        else:
+            # 字典形式：每个任务可配置
+            default_specific = int(specific_cfg.get("default", 1))
+            self.num_specific_experts = {
+                task: int(specific_cfg.get(task, default_specific)) for task in tasks
+            }
+
+        # expert MLP 配置
+        expert_mlp_dims = list(ple_cfg.get("expert_mlp_dims", []))
+        expert_output_dims = expert_mlp_dims + [in_dim] if expert_mlp_dims else [in_dim]
+        expert_dropout = float(ple_cfg.get("dropout", 0.0))
+        expert_activation = str(ple_cfg.get("activation", "relu"))
+        expert_use_bn = bool(ple_cfg.get("use_bn", False))
+
+        # ========== 新增：private expert 可选使用更小容量 ==========
+        private_expert_mlp_dims = ple_cfg.get("private_expert_mlp_dims")
+        if private_expert_mlp_dims:
+            private_expert_mlp_dims = list(private_expert_mlp_dims)
+            private_expert_output_dims = private_expert_mlp_dims + [in_dim] if private_expert_mlp_dims else [in_dim]
+        else:
+            private_expert_output_dims = expert_output_dims
+
+        logger.info(
+            f"[PLE] Homogeneous experts: shared={self.num_shared_experts}, "
+            f"specific={self.num_specific_experts}, expert_mlp_dims={expert_mlp_dims}"
+            + (f", private_expert_mlp_dims={private_expert_mlp_dims}" if private_expert_mlp_dims else "")
+        )
+
+        # ========== 构建 shared experts ==========
+        self.shared_experts = nn.ModuleList([
+            MLP(
+                input_dim=in_dim,
+                hidden_dims=expert_output_dims[:-1],
+                activation=expert_activation,
+                dropout=expert_dropout,
+                use_bn=expert_use_bn,
+            )
+            for _ in range(self.num_shared_experts)
+        ])
+
+        # ========== 构建 task-specific experts ==========
+        self.specific_experts = nn.ModuleDict()
+        for task in tasks:
+            num_specific = self.num_specific_experts[task]
+            self.specific_experts[task] = nn.ModuleList([
+                MLP(
+                    input_dim=in_dim,
+                    hidden_dims=private_expert_output_dims[:-1],
+                    activation=expert_activation,
+                    dropout=expert_dropout,
+                    use_bn=expert_use_bn,
+                )
+                for _ in range(num_specific)
+            ])
+        
+        # 同构专家不需要 output align
+        self._expert_output_aligner = None
+        
+        # 存储专家名称（用于日志/metrics）
+        self._expert_names: Dict[str, List[str]] = {}
+        for task in tasks:
+            shared_names = [f"shared_{i}" for i in range(self.num_shared_experts)]
+            private_names = [f"{task}_private_{i}" for i in range(self.num_specific_experts[task])]
+            self._expert_names[task] = shared_names + private_names
+
+    def _build_hetero_experts(
+        self,
+        ple_cfg: Dict[str, Any],
+        tasks: List[str],
+        in_dim: int,
+    ) -> None:
+        """
+        构建异构专家（新逻辑）。
+        
+        异构专家配置示例:
+          experts:
+            shared:
+              - {name: "mlp_deep", type: "mlp", dims: [256,128], ...}
+              - {name: "cross_v2", type: "crossnet_v2", num_layers: 3, ...}
+            private:
+              ctr:
+                - {name: "ctr_cross", type: "crossnet_v2", ...}
+              cvr:
+                - {name: "cvr_mlp", type: "mlp", ...}
+        
+        关键点:
+          1. 所有 expert 输出必须对齐到 expert_out_dim
+          2. 异构专家需要 ExpertOutputAlign 进行输出归一化
+          3. 支持 MLP / CrossNet-v2 / Identity 等多种类型
+        """
+        # 延迟导入以避免循环依赖
+        from src.models.mtl.experts import build_expert_list, PerTaskExpertAligner
+
+        experts_cfg = ple_cfg.get("experts", {})
+        
+        # ========== 解析 expert_out_dim ==========
+        # 如果未指定，默认使用 in_dim（与同构专家行为一致）
+        expert_out_dim = int(ple_cfg.get("expert_out_dim", in_dim))
+        self._expert_out_dim = expert_out_dim
+        
+        # ========== 构建 shared experts ==========
+        shared_specs = experts_cfg.get("shared", [])
+        self.num_shared_experts = len(shared_specs)
+        
+        self.shared_experts = build_expert_list(
+            specs=shared_specs,
+            in_dim=in_dim,
+            out_dim=expert_out_dim,
+        )
+        
+        # 记录 shared expert 名称
+        shared_expert_names = [
+            spec.get("name", f"shared_{i}") for i, spec in enumerate(shared_specs)
+        ]
+        
+        # ========== 构建 task-specific experts ==========
+        private_cfg = experts_cfg.get("private", {})
+        self.specific_experts = nn.ModuleDict()
+        self.num_specific_experts: Dict[str, int] = {}
+        self._expert_names: Dict[str, List[str]] = {}
+        
+        for task in tasks:
+            task_specs = private_cfg.get(task, [])
+            self.num_specific_experts[task] = len(task_specs)
+            
+            if task_specs:
+                self.specific_experts[task] = build_expert_list(
+                    specs=task_specs,
+                    in_dim=in_dim,
+                    out_dim=expert_out_dim,
+                )
+                private_names = [
+                    spec.get("name", f"{task}_private_{i}") for i, spec in enumerate(task_specs)
+                ]
+            else:
+                # 该任务没有 private experts
+                self.specific_experts[task] = nn.ModuleList()
+                private_names = []
+            
+            # 合并专家名称列表
+            self._expert_names[task] = shared_expert_names + private_names
+        
+        # ========== 构建 Expert Output Aligner ==========
+        # 异构专家输出对齐配置
+        align_cfg = ple_cfg.get("expert_output_align", {}) or {}
+        use_layernorm = bool(align_cfg.get("layernorm", True))  # 默认开启
+        use_learnable_scale = bool(align_cfg.get("learnable_scale", True))  # 默认开启
+        align_dropout = float(align_cfg.get("dropout", 0.0))
+        
+        # 计算每个任务的专家总数
+        task_num_experts = {
+            task: self.num_shared_experts + self.num_specific_experts[task]
+            for task in tasks
+        }
+        
+        self._expert_output_aligner = PerTaskExpertAligner(
+            task_num_experts=task_num_experts,
+            dim=expert_out_dim,
+            layernorm=use_layernorm,
+            learnable_scale=use_learnable_scale,
+            dropout=align_dropout,
+        )
+        
+        # 日志输出
+        logger.info(
+            f"[PLE] Heterogeneous experts: shared={self.num_shared_experts} "
+            f"[{', '.join(shared_expert_names)}], "
+            f"private={self.num_specific_experts}, "
+            f"expert_out_dim={expert_out_dim}"
+        )
+        logger.info(
+            f"[PLE] Expert output align: layernorm={use_layernorm}, "
+            f"learnable_scale={use_learnable_scale}, dropout={align_dropout}"
+        )
+
     def _get_head_add_cfg(self, task: str) -> Dict[str, bool]:
         """获取每个 head 是否添加 wide/fm logit 的配置（与 mmoe.py 对齐）。"""
         task = task.lower()
@@ -487,6 +717,11 @@ class PLE(nn.Module):
             # ========== Mixing：加权求和 ==========
             # stacked: [B, D, K]
             stacked = torch.stack(all_expert_outputs, dim=2)
+            
+            # ========== 异构专家输出对齐（仅在启用时生效）==========
+            if self._expert_output_aligner is not None:
+                stacked = self._expert_output_aligner(task, stacked)
+            
             # gate_w: [B, K] -> [B, K, 1]
             weights = gate_w.unsqueeze(-1)  # [B, K, 1]
             # bmm: [B, D, K] @ [B, K, 1] -> [B, D, 1] -> squeeze -> [B, D]
@@ -531,6 +766,13 @@ class PLE(nn.Module):
         aux = dict(out.get("aux", {})) if "aux" in out else {}
         if self.log_gates and gate_weights_dict:
             aux["gates"] = gate_weights_dict
+            
+            # ========== 新增：计算 per-expert routing metrics ==========
+            # 对每个 task 计算各专家的 hit rate（被选为 top1 的比例）
+            if hasattr(self, "_expert_names") and self._expert_names:
+                expert_metrics = self._compute_expert_routing_metrics(gate_weights_dict)
+                for k, v in expert_metrics.items():
+                    aux[k] = v
 
         # ========== 计算 gate 正则化损失（与 mmoe.py 对齐，但支持 shared_only scope）==========
         if self.gate_stabilize_enabled and self.training and gate_weights_for_reg:
@@ -767,6 +1009,74 @@ class PLE(nn.Module):
             metrics[f"gate_shared_mass_floor_loss_{task}"] = float(task_loss.detach().cpu().item())
         
         return total_loss, metrics
+
+    def _compute_expert_routing_metrics(
+        self,
+        gate_weights_dict: Dict[str, torch.Tensor],
+    ) -> Dict[str, Any]:
+        """
+        计算 per-expert 路由统计指标（用于监控异构专家的利用率）。
+        
+        对每个 task 计算：
+          - gate_{task}_expert_top1_share: Dict[expert_name -> top1 选择频率]
+          - gate_{task}_expert_mean_weight: Dict[expert_name -> 平均权重]
+        
+        这些指标有助于诊断：
+          - 某些专家是否被忽略（权重接近 0）
+          - 某些专家是否垄断了所有流量（top1 share 接近 1）
+          - 异构专家是否有分化（不同类型专家被不同程度使用）
+        
+        Args:
+            gate_weights_dict: Dict[task -> gate_weights [B, K]]
+            
+        Returns:
+            Dict containing per-task per-expert routing statistics
+        """
+        metrics: Dict[str, Any] = {}
+        
+        for task, gate_w in gate_weights_dict.items():
+            # 跳过未启用的 task
+            if task not in self._expert_names:
+                continue
+            
+            expert_names = self._expert_names[task]
+            K = len(expert_names)
+            
+            # 确保维度匹配
+            if gate_w.size(-1) != K:
+                logger.warning(
+                    f"Gate weights dim ({gate_w.size(-1)}) != expert count ({K}) for task {task}"
+                )
+                continue
+            
+            gate_w_f32 = gate_w.float()
+            
+            # ========== Top-1 Selection Share ==========
+            # 计算每个 expert 被选为 top1 的频率
+            top1_indices = torch.argmax(gate_w_f32, dim=-1)  # [B]
+            top1_counts = torch.bincount(top1_indices, minlength=K).float()  # [K]
+            top1_share = top1_counts / (top1_counts.sum() + 1e-8)  # 归一化
+            
+            # 转换为 expert_name -> share 的字典
+            expert_top1_share = {
+                name: float(top1_share[i].cpu().item())
+                for i, name in enumerate(expert_names)
+            }
+            metrics[f"gate_{task}_expert_top1_share"] = expert_top1_share
+            
+            # ========== Mean Weight per Expert ==========
+            # 计算每个 expert 的平均 gate 权重
+            mean_weights = gate_w_f32.mean(dim=0)  # [K]
+            expert_mean_weight = {
+                name: float(mean_weights[i].cpu().item())
+                for i, name in enumerate(expert_names)
+            }
+            metrics[f"gate_{task}_expert_mean_weight"] = expert_mean_weight
+            
+            # ========== 额外指标：是否启用了异构专家 ==========
+            metrics["hetero_experts_enabled"] = self._use_hetero_experts
+        
+        return metrics
 
 
 __all__ = ["PLE"]

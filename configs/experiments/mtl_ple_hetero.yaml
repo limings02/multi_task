@@ -1,0 +1,304 @@
+# ============================================================================
+# PLE-Lite with Heterogeneous Experts Configuration Example
+# ============================================================================
+# 
+# This configuration demonstrates the new heterogeneous expert feature for PLE-Lite.
+# Key features:
+#   - Different expert architectures (MLP, CrossNet-v2) can be mixed
+#   - Per-expert configuration (dims, activation, dropout, etc.)
+#   - Output alignment for stable gate mixing
+#   - Full backward compatibility (set hetero_enabled: false to use legacy mode)
+#
+# ============================================================================
+
+experiment:
+  name: "deepfm_ple_lite_hetero_experts"
+
+# ESMM toggle
+use_esmm: true
+esmm:
+  version: "v2"
+  eps: 1.0e-8
+  lambda_ctr: 1.0
+  lambda_ctcvr: 1.0
+  lambda_cvr_aux: 0.1
+
+data:
+  metadata_path: "data/processed/metadata.json"
+  batch_size: 1024
+  num_workers: 6
+  num_workers_valid: 2
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: false
+  drop_last: false
+  debug: false
+  seed: 20260127
+  neg_keep_prob_train: 1.0
+
+sampling:
+  negative_sampling: "none"
+
+embedding:
+  default_embedding_dim: 8
+  embedding_dim_overrides: {}
+  mode: "sum"
+  sparse_grad: true
+
+model:
+  name: "deepfm_ple"
+  mtl: "ple"
+  enabled_heads: ["ctr", "cvr"]
+  tasks: ["ctr", "cvr"]
+  backbone:
+    use_legacy_pseudo_deepfm: false
+    return_logit_parts: true
+    per_head_add:
+      ctr: { use_wide: true, use_fm: true }
+      cvr: { use_wide: false, use_fm: false }
+    deep_hidden_dims: [128, 64]
+    deep_dropout: 0.2
+    deep_activation: relu
+    deep_use_bn: false
+    fm_enabled: true
+    fm_projection_dim: 16
+    out_dim: 64
+  
+  # ==========================================================================
+  # PLE-Lite with Heterogeneous Experts Configuration
+  # ==========================================================================
+  ple:
+    # ---------- 异构专家开关（向前兼容）----------
+    # 设为 false 可强制回退到旧的同构专家实现
+    # 即使 experts 配置存在，也会被忽略
+    hetero_enabled: true
+    
+    # ---------- Expert Output Dimension ----------
+    # 所有专家的输出必须对齐到此维度（gate 加权混合的基础）
+    # 如果某专家原始输出不是此维度，会自动添加投影层
+    expert_out_dim: 128
+    
+    # ---------- Expert Output Alignment（异构必需）----------
+    # 由于不同类型专家输出的数值分布可能差异很大，
+    # 需要对齐处理以确保 gate 混合稳定
+    expert_output_align:
+      layernorm: true        # 对每个专家输出做 LayerNorm（推荐开启）
+      learnable_scale: true  # 每专家一个可学习缩放因子（推荐开启）
+      dropout: 0.1           # 可选 dropout
+    
+    # ---------- Heterogeneous Experts Configuration ----------
+    # 注意：当 hetero_enabled=true 且 experts 存在时才生效
+    experts:
+      # ===== Shared Experts（所有任务共享）=====
+      # 长度必须等于旧配置中的 shared_num_experts（用于校验）
+      shared:
+        # Expert 0: Deep MLP for complex feature interactions
+        - name: "mlp_deep"
+          type: "mlp"
+          dims: [256, 128]
+          activation: "relu"
+          dropout: 0.1
+          use_bn: false
+        
+        # Expert 1: Shallow MLP for simple patterns
+        - name: "mlp_shallow"
+          type: "mlp"
+          dims: [128]
+          activation: "relu"
+          dropout: 0.05
+          use_bn: false
+        
+        # Expert 2: CrossNet-v2 for explicit feature crossing
+        - name: "cross_v2"
+          type: "crossnet_v2"
+          num_layers: 3
+          low_rank: 64            # 使用 low-rank 分解减少参数
+          use_bias: true
+          proj:
+            enabled: true
+            out_dim: 128          # 投影到 expert_out_dim
+        
+        # Expert 3: Smaller CrossNet-v2
+        - name: "cross_v2_small"
+          type: "crossnet_v2"
+          num_layers: 2
+          low_rank: 32
+          use_bias: true
+          proj:
+            enabled: true
+            out_dim: 128
+      
+      # ===== Private Experts（每任务专属）=====
+      private:
+        ctr:
+          # CTR 任务专属：CrossNet 捕捉点击相关的特征交叉
+          - name: "ctr_cross"
+            type: "crossnet_v2"
+            num_layers: 3
+            low_rank: 64
+            use_bias: true
+            proj:
+              enabled: true
+              out_dim: 128
+        
+        cvr:
+          # CVR 任务专属：简单 MLP 避免过拟合（CVR 样本稀疏）
+          - name: "cvr_mlp"
+            type: "mlp"
+            dims: [128]
+            activation: "relu"
+            dropout: 0.05
+            use_bn: false
+    
+    # ---------- 以下为旧配置（仅在 hetero_enabled=false 时生效）----------
+    # 保留这些配置以便快速切回同构模式
+    shared_num_experts: 4       # 必须与 experts.shared 长度一致（校验用）
+    specific_num_experts:
+      ctr: 1
+      cvr: 1
+    expert_mlp_dims: [128]      # 同构模式下的专家 MLP 配置
+    dropout: 0.2
+    activation: relu
+    use_bn: false
+
+    # ---------- Gate 配置 ----------
+    gate_type: "linear"
+    gate_hidden_dims: [64]
+    log_gates: true
+
+    # ---------- Gate 稳定化配置 ----------
+    gate_stabilize:
+      enabled: true
+      eps: 1.0e-8
+      entropy_reg_weight: 2.0e-3
+      load_balance_kl_weight: 2.0e-3
+      log_stats: true
+      schedule:
+        enabled: true
+        warm_frac: 0.2
+        temperature_start: 1.5
+        temperature_end: 1.0
+        noise_std_start: 0.05
+        noise_std_end: 0.0
+
+    gate_reg_scope: "shared_only"
+
+    # ---------- Shared Mass Floor（防止 private 吞噬 shared）----------
+    gate_shared_mass_floor:
+      enabled: false
+      per_task:
+        ctr:
+          min_mass: 0.4
+          weight: 1.0e-3
+        cvr:
+          min_mass: 0.2
+          weight: 5.0e-4
+
+    # ---------- Input Composer 配置 ----------
+    input: "deep_h"
+    add_fm_vec: true
+    add_emb: "mean"
+    part_proj_dim: 128
+    fusion: "concat"
+    adapter_mlp_dims: [128]
+    norm: "layernorm"
+
+  heads:
+    default:
+      mlp_dims: [128]
+      dropout: 0.1
+      use_bn: false
+      activation: "relu"
+    ctr: {}
+    cvr: {}
+  
+  deep_hidden_dims: [256, 128]
+  deep_dropout: 0.2
+  deep_activation: "relu"
+  deep_use_bn: false
+  fm_enabled: true
+  fm_projection_dim: 16
+  out_dim: 128
+
+optim:
+  type: dual_sparse_dense
+  dense:
+    lr: 0.0006
+    weight_decay: 1e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  sparse:
+    enabled: true
+    lr: 0.001
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    allow_fallback_if_empty: false
+  lr_scheduler:
+    enabled: true
+    target: "both"
+    type: "cosine"
+    warmup_steps: 5000
+    total_steps: 40000
+    min_lr_ratio: 0.1
+
+loss:
+  w_ctr: 1.0
+  w_cvr: 1.0
+  eps: 1.0e-6
+  pos_weight_dynamic: false
+  static_pos_weight:
+    ctr: 1
+    ctcvr: 1
+  pos_weight_clip:
+    ctr: 30
+    ctcvr: 300
+  pos_weight_clip_schedule:
+    enabled: false
+    target: "ctcvr"
+    type: "piecewise"
+    milestones: [0, 8000]
+    values: [300, 30]
+  aux_focal:
+    enabled: false
+    warmup_steps: 8000
+    target_head: "ctcvr"
+    lambda: 0.05
+    gamma: 1.0
+    use_alpha: false
+    alpha: 0.25
+    detach_p_for_weight: true
+    compute_fp32: true
+    log_components: true
+
+runtime:
+  device: "cuda"
+  epochs: 1
+  log_every: 5000
+  amp: true
+  grad_diag_enabled: true
+  grad_diag_every: 1000
+  grad_diag_min_tasks: 2
+  log_health_metrics: true
+  max_train_steps: null
+  max_valid_steps: null
+  grad_clip_norm: 2.0
+  seed: 20260127
+  resume_path: null
+  auto_eval: true
+  auto_eval_split: "valid"
+  auto_eval_save_preds: true
+  auto_eval_ckpt: "best"
+  save_last: false
+  best_selection:
+    strategy: "gate"
+    primary_key: "auc_ctcvr"
+    aux_keys: ["auc_ctr", "auc_cvr"]
+    use_primary_ma: false
+    ma_window: 5
+    tol_primary: 0.002
+    tol_aux:
+      auc_ctr: 0.003
+      auc_cvr: 0.008
+    confirm_times: 1
+    cooldown_evals: 1
+    log_decision: true

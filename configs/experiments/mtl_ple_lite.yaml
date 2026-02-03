@@ -72,7 +72,7 @@ model:
 
     # ---------- Gate 配置 ----------
     gate_type: "linear"  # linear | mlp
-    gate_hidden_dims: []
+    gate_hidden_dims: [64]
     log_gates: true  # Enable gate weight logging for health metrics
 
     # ---------- Gate 稳定化配置（与 mmoe 完全对齐）----------
@@ -233,7 +233,7 @@ runtime:
     aux_keys: ["auc_ctr", "auc_cvr"]
     
     # Use moving average for primary metric (reduces spike sensitivity)
-    use_primary_ma: true
+    use_primary_ma: false
     ma_window: 5
     
     # Tolerance: primary must improve by at least this amount
