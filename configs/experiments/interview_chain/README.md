@@ -28,7 +28,7 @@ cat runs/interview_chain/summary.json
 ```bash
 # 断点续跑（跳过已完成的实验）
 make interview-chain-resume
-
+python scripts/run_interview_chain.py --resume
 # 只打印命令（调试用）
 make interview-chain-dry-run
 

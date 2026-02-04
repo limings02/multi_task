@@ -30,7 +30,7 @@ data:
   metadata_path: "data/processed/metadata.json"
   batch_size: 1024                    # 公共锁定
   num_workers: 6
-  num_workers_valid: 2
+  num_workers_valid: 0
   prefetch_factor: 2
   pin_memory: true
   persistent_workers: false
@@ -164,14 +164,14 @@ loss:
 # ============================================================================
 runtime:
   device: "cuda"
-  epochs: 1
-  log_every: 5000
+  epochs: 2
+  log_every: 3000
   amp: true
   grad_diag_enabled: true
   grad_diag_every: 1000
   grad_diag_min_tasks: 2
   log_health_metrics: true
-  max_train_steps: 40000              # 公共锁定：确保所有实验训练步数一致
+  max_train_steps: 80000              # 公共锁定：确保所有实验训练步数一致
   max_valid_steps: null
   grad_clip_norm: 2.0
   seed: 20260127                      # 公共锁定
@@ -189,10 +189,10 @@ runtime:
     aux_keys: ["auc_ctr", "auc_cvr"]
     use_primary_ma: false
     ma_window: 5
-    tol_primary: 0.002
+    tol_primary: 0.0001
     tol_aux:
       auc_ctr: 0.003
       auc_cvr: 0.008
     confirm_times: 1
-    cooldown_evals: 1
+    cooldown_evals: 0
     log_decision: true

@@ -83,10 +83,14 @@ def _resolve_run_dir(run_dir: Optional[str | Path], ckpt_path: Optional[str | Pa
 
 def _build_dataloader(cfg: Dict[str, Any], split: str, feature_meta: Dict[str, Any]):
     data_cfg = cfg.get("data", {})
+    # Use num_workers_valid for eval to avoid multiprocessing issues
+    num_workers = int(data_cfg.get("num_workers_valid", data_cfg.get("num_workers", 0)))
+    # Only set prefetch_factor if num_workers > 0 (required by PyTorch DataLoader)
+    prefetch = int(data_cfg.get("prefetch_factor", 2)) if num_workers > 0 else None
     return make_dataloader(
         split=split,
         batch_size=int(data_cfg.get("batch_size", 256)),
-        num_workers=int(data_cfg.get("num_workers", 0)),
+        num_workers=num_workers,
         shuffle=False,
         drop_last=False,
         pin_memory=bool(data_cfg.get("pin_memory", True)),
@@ -94,6 +98,7 @@ def _build_dataloader(cfg: Dict[str, Any], split: str, feature_meta: Dict[str, A
         seed=data_cfg.get("seed"),
         feature_meta=feature_meta,
         debug=bool(data_cfg.get("debug", False)),
+        prefetch_factor=prefetch,
     )
 
 

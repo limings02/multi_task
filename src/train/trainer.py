@@ -173,6 +173,8 @@ class Trainer:
         # Default to half of train workers or max 2 to prevent OOM with persistent_workers
         train_workers = int(cfg["data"].get("num_workers", 0))
         valid_workers = int(cfg["data"].get("num_workers_valid", max(1, train_workers // 2)))
+        # Only set prefetch_factor if num_workers > 0 (required by PyTorch DataLoader)
+        valid_prefetch = int(cfg["data"].get("prefetch_factor", 2)) if valid_workers > 0 else None
         self.valid_loader = make_dataloader(
             split="valid",
             batch_size=int(cfg["data"]["batch_size"]),
@@ -184,7 +186,7 @@ class Trainer:
             seed=cfg["data"].get("seed"),
             feature_meta=self.feature_meta,
             debug=bool(cfg["data"].get("debug", False) or self.debug_dataloader_assert),
-            prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
+            prefetch_factor=valid_prefetch,
         )
 
         self.model = build_model(cfg).to(self.device)

@@ -472,10 +472,13 @@ def run_experiment(
     # 提取 best 指标
     if run_dir and run_dir.exists():
         metrics = extract_best_metrics_from_run_dir(run_dir)
+        auc_ctr_str = f"{metrics.get('auc_ctr'):.4f}" if metrics.get('auc_ctr') else 'N/A'
+        auc_cvr_str = f"{metrics.get('auc_cvr'):.4f}" if metrics.get('auc_cvr') else 'N/A'
+        auc_ctcvr_str = f"{metrics.get('auc_ctcvr'):.4f}" if metrics.get('auc_ctcvr') else 'N/A'
         print_step(f"Best 指标: step={metrics.get('best_step')}, "
-                   f"auc_ctr={metrics.get('auc_ctr'):.4f if metrics.get('auc_ctr') else 'N/A'}, "
-                   f"auc_cvr={metrics.get('auc_cvr'):.4f if metrics.get('auc_cvr') else 'N/A'}, "
-                   f"auc_ctcvr={metrics.get('auc_ctcvr'):.4f if metrics.get('auc_ctcvr') else 'N/A'}")
+                   f"auc_ctr={auc_ctr_str}, "
+                   f"auc_cvr={auc_cvr_str}, "
+                   f"auc_ctcvr={auc_ctcvr_str}")
     else:
         metrics = {"error": "run_dir not found"}
     

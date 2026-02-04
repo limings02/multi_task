@@ -1,5 +1,15 @@
 # Interview Chain 实现总结
 
+# 一键运行所有实验
+make interview-chain
+
+# 或者
+python scripts/run_interview_chain.py
+
+# 查看结果
+cat runs/interview_chain/summary.csv
+cat runs/interview_chain/delta_analysis.txt
+
 ## 📦 交付内容清单
 
 本次实现完成了"主线 7 个实验"的完整配置设计与一键运行流程，所有改动均可直接运行，且有充分注释。
