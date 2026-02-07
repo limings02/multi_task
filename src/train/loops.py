@@ -274,7 +274,7 @@ def train_one_epoch(
         t_data_end = time.time()
         data_load_time += t_data_end - t_batch_start
         
-        if max_steps is not None and step >= max_steps:
+        if max_steps is not None and current_global_step >= max_steps:
             break
 
         # Update global_step in loss_fn for aux_focal warmup control

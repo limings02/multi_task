@@ -318,8 +318,15 @@ class Trainer:
                 run_dir=self.run_dir,
             )
             # 设置模型内部数据引用（如果模型支持）
+            # 支持 PLE: model.ple.get_expert_health_data()
+            # 支持 MMoE: model.get_expert_health_data() (when model is MMoE directly)
+            health_data = None
             if hasattr(self.model, "ple") and hasattr(self.model.ple, "get_expert_health_data"):
                 health_data = self.model.ple.get_expert_health_data()
+            elif hasattr(self.model, "get_expert_health_data"):
+                health_data = self.model.get_expert_health_data()
+            
+            if health_data is not None:
                 self.expert_health_diag.set_expert_modules(health_data.get("expert_modules", []))
                 self.expert_health_diag.set_aligners(health_data.get("aligners", {}))
                 for task, names in health_data.get("expert_names", {}).items():

@@ -1,21 +1,33 @@
 # ============================================================================
-# Interview Chain - E0b: Single-Task CVR Baseline
+# Interview Chain - E4: PLE-Lite (Homogeneous) + ESMM v2
 # ============================================================================
-# 实验定位：单任务 CVR 基线（DeepFM，只有 cvr head）
+# 实验定位：DeepFM shared-bottom + PLE-Lite（同构专家模式）+ ESMM v2
 # 关键变量：
-#   - model.enabled_heads = ["cvr"]
-#   - model.tasks = ["cvr"]
-#   - use_esmm = false（单任务不需要 ESMM）
-#   - best_selection.primary_key = "auc_cvr"
+#   - model.mtl = "ple"（E4 特异）
+#   - model.ple.hetero_enabled = false（E4 特异：强制同构专家模式）
+#   - model.ple.shared_num_experts = 4
+#   - model.ple.specific_num_experts = {ctr: 1, cvr: 1}
+#   - use_esmm = true（继承 E2/E3）
 # 
-# 注意：CVR 样本稀疏，只在 click=1 的样本上训练（这是数据集特性，不是配置项）
+# PLE 原理：
+#   - Shared experts：所有任务共享
+#   - Private experts：每任务专属
+#   - 每任务的 gate 从 shared + 该任务的 private 中选择
+# 
+# 同构模式：所有专家架构相同（MLP with expert_mlp_dims）
 # ============================================================================
 
 experiment:
-  name: "interview_E0b_deepfm_st_cvr"
+  name: "interview_E4_deepfm_ple_lite_homo_esmm"
 
-# ESMM toggle（单任务不使用 ESMM）
-use_esmm: false
+# ESMM toggle（E4 继承 E2/E3：启用 ESMM）
+use_esmm: true
+esmm:
+  version: "v2"
+  eps: 1.0e-8
+  lambda_ctr: 1.0
+  lambda_ctcvr: 1.0
+  lambda_cvr_aux: 0.1
 
 # ============================================================================
 # Data Config（公共锁定）
@@ -23,7 +35,7 @@ use_esmm: false
 data:
   metadata_path: "data/processed/metadata.json"
   batch_size: 1024                    # 公共锁定
-  num_workers: 5
+  num_workers: 2
   num_workers_valid: 2
   prefetch_factor: 1
   pin_memory: true
@@ -34,7 +46,7 @@ data:
   neg_keep_prob_train: 1.0            # 不使用 negative sampling
 
 sampling:
-  negative_sampling: "none"           # 所有实验统一为 none
+  negative_sampling: "none"           # ESMM 约束：必须为 none
 
 # ============================================================================
 # Embedding Config（公共锁定）
@@ -49,17 +61,17 @@ embedding:
 # Model Config
 # ============================================================================
 model:
-  name: "deepfm_st_cvr"
-  mtl: "sharedbottom"                 # 单任务也用 sharedbottom（只有一个 head）
-  enabled_heads: ["cvr"]              # E0b 特异：只有 cvr
-  tasks: ["cvr"]                      # E0b 特异：只有 cvr
+  name: "deepfm_ple_lite_homo_esmm"
+  mtl: "ple"                          # E4 特异：PLE-Lite
+  enabled_heads: ["ctr", "cvr"]       # 双任务
+  tasks: ["ctr", "cvr"]               # 双任务
   
   # Backbone 配置（公共锁定）
   backbone:
     use_legacy_pseudo_deepfm: false
     return_logit_parts: true
     per_head_add:
-      # CTR head 不存在，无需配置
+      ctr: { use_wide: true, use_fm: true }
       cvr: { use_wide: false, use_fm: false }
     deep_hidden_dims: [128, 64]
     deep_dropout: 0.2
@@ -69,6 +81,66 @@ model:
     fm_projection_dim: 16
     out_dim: 64
   
+  # PLE-Lite 配置（E4 特异）
+  ple:
+    # 异构专家开关（E4 强制关闭）
+    hetero_enabled: false             # E4 特异：使用同构专家模式
+    
+    # 专家输出维度（同构模式必需）
+    expert_out_dim: 128
+    
+    # 同构专家配置（E4 特异）
+    shared_num_experts: 4             # 4 个共享专家
+    specific_num_experts:
+      ctr: 1                          # CTR 任务 1 个专属专家
+      cvr: 1                          # CVR 任务 1 个专属专家
+    expert_mlp_dims: [128]            # 所有专家统一架构：单层 MLP(128)
+    dropout: 0.2                      # 专家内部 dropout
+    activation: relu
+    use_bn: false
+    
+    # Gate 配置
+    gate_type: "linear"
+    gate_hidden_dims: [64]
+    log_gates: true
+    
+    # Gate 稳定化配置
+    gate_stabilize:
+      enabled: true
+      eps: 1.0e-8
+      entropy_reg_weight: 2.0e-3
+      load_balance_kl_weight: 2.0e-3
+      log_stats: true
+      schedule:
+        enabled: true
+        warm_frac: 0.2
+        temperature_start: 1.5
+        temperature_end: 1.0
+        noise_std_start: 0.05
+        noise_std_end: 0.0
+    
+    gate_reg_scope: "shared_only"
+    
+    # Shared Mass Floor（防止 private 吞噬 shared）
+    gate_shared_mass_floor:
+      enabled: true
+      per_task:
+        ctr:
+          min_mass: 0.5
+          weight: 1.0e-3
+        cvr:
+          min_mass: 0.2
+          weight: 5.0e-4
+    
+    # Input Composer 配置
+    input: "deep_h"
+    add_fm_vec: true
+    add_emb: "mean"
+    part_proj_dim: 128
+    fusion: "concat"
+    adapter_mlp_dims: [128]
+    norm: "layernorm"
+  log_gates: true
   # Head 配置（公共锁定）
   heads:
     default:
@@ -76,6 +148,7 @@ model:
       dropout: 0.1
       use_bn: false
       activation: "relu"
+    ctr: {}
     cvr: {}
   
   # Deep 网络配置（公共锁定）
@@ -115,7 +188,7 @@ optim:
 # Loss Config（公共锁定）
 # ============================================================================
 loss:
-  w_ctr: 1.0                          # CTR 不存在，但保留字段避免报错
+  w_ctr: 1.0
   w_cvr: 1.0
   eps: 1.0e-6
   pos_weight_dynamic: false
@@ -153,7 +226,7 @@ runtime:
   amp: true
   grad_diag_enabled: true
   grad_diag_every: 1000
-  grad_diag_min_tasks: 2              # 单任务时不会触发，但保留字段
+  grad_diag_min_tasks: 2
   log_health_metrics: true
   max_train_steps: 80000              # 公共锁定：确保所有实验训练步数一致
   max_valid_steps: null
@@ -166,15 +239,46 @@ runtime:
   auto_eval_ckpt: "best"
   save_last: false
   
-  # BestSelector 配置（E0b 特异：只关注 auc_cvr）
+  # BestSelector 配置（ESMM 模式：primary=ctcvr, aux=ctr/cvr）
   best_selection:
     strategy: "gate"
-    primary_key: "auc_cvr"            # E0b 特异：单任务 CVR 主指标
-    aux_keys: []                      # 无辅助指标
+    primary_key: "auc_ctcvr"          # E4 继承 E2/E3：ESMM 模式下关注 CTCVR
+    aux_keys: ["auc_ctr", "auc_cvr"]
     use_primary_ma: false
     ma_window: 5
     tol_primary: 0.0001
-    tol_aux: {}
+    tol_aux:
+      auc_ctr: 0.003
+      auc_cvr: 0.008
     confirm_times: 1
     cooldown_evals: 0
     log_decision: true
+  
+  # 专家健康诊断配置
+  expert_health_diag:
+    enabled: true
+    log_interval: 1000
+    log_on_valid: true
+    utilization:
+      enabled: true
+      dead_threshold: 0.01
+      monopoly_threshold: 0.8
+      compute_gini: true
+    output_stats:
+      enabled: true
+      per_expert_stats: true
+      cross_expert_similarity: true
+      similarity_alert_threshold: 0.95
+    gradient:
+      enabled: true
+      per_expert_grad_norm: true
+      vanish_threshold: 1.0e-6
+      explode_threshold: 100.0
+    type_specialization:
+      enabled: true
+      aggregate_by_type: true
+      cross_task_specialization: true
+    aligner:
+      enabled: true
+      log_scale_stats: true
+      log_distribution_change: false

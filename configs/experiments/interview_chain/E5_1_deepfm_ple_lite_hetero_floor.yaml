@@ -1,26 +1,25 @@
 # ============================================================================
-# Interview Chain - E4: PLE-Lite (Homogeneous) + ESMM v2
+# Interview Chain - E5: PLE-Lite (Heterogeneous) + ESMM v2
 # ============================================================================
-# 实验定位：DeepFM shared-bottom + PLE-Lite（同构专家模式）+ ESMM v2
+# 实验定位：DeepFM shared-bottom + PLE-Lite（异构专家模式）+ ESMM v2
+# 这是当前"终态"配置，代表最先进的模型架构
+# 
 # 关键变量：
-#   - model.mtl = "ple"（E4 特异）
-#   - model.ple.hetero_enabled = false（E4 特异：强制同构专家模式）
-#   - model.ple.shared_num_experts = 4
-#   - model.ple.specific_num_experts = {ctr: 1, cvr: 1}
-#   - use_esmm = true（继承 E2/E3）
+#   - model.ple.hetero_enabled = true（E5 特异：启用异构专家）
+#   - model.ple.experts.shared/private：每个专家独立配置（MLP/CrossNet-v2）
+#   - model.ple.expert_output_align：对齐不同类型专家的输出
+#   - use_esmm = true（继承 E2/E3/E4）
 # 
-# PLE 原理：
-#   - Shared experts：所有任务共享
-#   - Private experts：每任务专属
-#   - 每任务的 gate 从 shared + 该任务的 private 中选择
-# 
-# 同构模式：所有专家架构相同（MLP with expert_mlp_dims）
+# 异构专家优势：
+#   - 不同专家可以是不同类型（MLP 擅长泛化，CrossNet 擅长特征交叉）
+#   - 专家多样性更高，避免专家坍缩
+#   - 输出对齐机制确保 gate 混合稳定
 # ============================================================================
 
 experiment:
-  name: "interview_E4_deepfm_ple_lite_homo_esmm"
+  name: "interview_E5_deepfm_ple_lite_hetero_esmm"
 
-# ESMM toggle（E4 继承 E2/E3：启用 ESMM）
+# ESMM toggle（E5 继承 E2/E3/E4：启用 ESMM）
 use_esmm: true
 esmm:
   version: "v2"
@@ -61,8 +60,8 @@ embedding:
 # Model Config
 # ============================================================================
 model:
-  name: "deepfm_ple_lite_homo_esmm"
-  mtl: "ple"                          # E4 特异：PLE-Lite
+  name: "deepfm_ple_lite_hetero_esmm"
+  mtl: "ple"                          # E5 继承 E4：PLE-Lite
   enabled_heads: ["ctr", "cvr"]       # 双任务
   tasks: ["ctr", "cvr"]               # 双任务
   
@@ -81,21 +80,89 @@ model:
     fm_projection_dim: 16
     out_dim: 64
   
-  # PLE-Lite 配置（E4 特异）
+  # PLE-Lite 配置（E5 特异：异构专家模式）
   ple:
-    # 异构专家开关（E4 强制关闭）
-    hetero_enabled: false             # E4 特异：使用同构专家模式
+    # 异构专家开关（E5 启用）
+    hetero_enabled: true              # E5 特异：启用异构专家
     
-    # 专家输出维度（同构模式必需）
+    # 专家输出维度（所有专家必须对齐到此维度）
     expert_out_dim: 128
     
-    # 同构专家配置（E4 特异）
-    shared_num_experts: 4             # 4 个共享专家
+    # Expert Output Alignment（异构模式必需）
+    expert_output_align:
+      layernorm: true                 # 对每个专家输出做 LayerNorm
+      learnable_scale: true           # 每专家一个可学习缩放因子
+      dropout: 0.1
+    
+    # Heterogeneous Experts Configuration（E5 特异）
+    experts:
+      # ===== Shared Experts（所有任务共享）=====
+      shared:
+        # Expert 0: Deep MLP for complex feature interactions
+        - name: "mlp_deep"
+          type: "mlp"
+          dims: [256, 128]
+          activation: "relu"
+          dropout: 0.1
+          use_bn: false
+        
+        # Expert 1: Shallow MLP for simple patterns
+        - name: "mlp_shallow"
+          type: "mlp"
+          dims: [128]
+          activation: "relu"
+          dropout: 0.05
+          use_bn: false
+        
+        # Expert 2: CrossNet-v2 for explicit feature crossing
+        - name: "cross_v2"
+          type: "crossnet_v2"
+          num_layers: 3
+          low_rank: 64
+          use_bias: true
+          proj:
+            enabled: true
+            out_dim: 128
+        
+        # Expert 3: Smaller CrossNet-v2
+        - name: "cross_v2_small"
+          type: "crossnet_v2"
+          num_layers: 2
+          low_rank: 32
+          use_bias: true
+          proj:
+            enabled: true
+            out_dim: 128
+      
+      # ===== Private Experts（每任务专属）=====
+      private:
+        ctr:
+          # CTR 任务专属：CrossNet 捕捉点击相关的特征交叉
+          - name: "ctr_cross"
+            type: "crossnet_v2"
+            num_layers: 3
+            low_rank: 64
+            use_bias: true
+            proj:
+              enabled: true
+              out_dim: 128
+        
+        cvr:
+          # CVR 任务专属：简单 MLP 避免过拟合（CVR 样本稀疏）
+          - name: "cvr_mlp"
+            type: "mlp"
+            dims: [128]
+            activation: "relu"
+            dropout: 0.05
+            use_bn: false
+    
+    # 以下为旧配置（异构模式下被忽略，但保留以便快速切回同构模式）
+    shared_num_experts: 4
     specific_num_experts:
-      ctr: 1                          # CTR 任务 1 个专属专家
-      cvr: 1                          # CVR 任务 1 个专属专家
-    expert_mlp_dims: [128]            # 所有专家统一架构：单层 MLP(128)
-    dropout: 0.2                      # 专家内部 dropout
+      ctr: 1
+      cvr: 1
+    expert_mlp_dims: [128]
+    dropout: 0.2
     activation: relu
     use_bn: false
     
@@ -123,10 +190,10 @@ model:
     
     # Shared Mass Floor（防止 private 吞噬 shared）
     gate_shared_mass_floor:
-      enabled: false
+      enabled: true
       per_task:
         ctr:
-          min_mass: 0.4
+          min_mass: 0.5
           weight: 1.0e-3
         cvr:
           min_mass: 0.2
@@ -242,7 +309,7 @@ runtime:
   # BestSelector 配置（ESMM 模式：primary=ctcvr, aux=ctr/cvr）
   best_selection:
     strategy: "gate"
-    primary_key: "auc_ctcvr"          # E4 继承 E2/E3：ESMM 模式下关注 CTCVR
+    primary_key: "auc_ctcvr"          # E5 继承 E2/E3/E4：ESMM 模式下关注 CTCVR
     aux_keys: ["auc_ctr", "auc_cvr"]
     use_primary_ma: false
     ma_window: 5
@@ -254,7 +321,7 @@ runtime:
     cooldown_evals: 0
     log_decision: true
   
-  # 专家健康诊断配置
+  # 专家健康诊断配置（E5 启用）
   expert_health_diag:
     enabled: true
     log_interval: 1000

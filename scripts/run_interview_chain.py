@@ -91,6 +91,13 @@ EXPERIMENT_MANIFEST = [
         "key_vars": ["mtl=mmoe", "num_experts=4"],
     },
     {
+        "id": "E3.1",
+        "name": "interview_E3_1_deepfm_mmoe_gate_stabilize_esmm",
+        "config": "configs/experiments/interview_chain/E3_1_deepfm_mmoe_gate_stabilize_esmm.yaml",
+        "description": "MMoE + Gate Stabilize + ESMM v2（E3 消融：验证 gate 稳定化的效果）",
+        "key_vars": ["mtl=mmoe", "gate_stabilize=enabled", "num_experts=4"],
+    },
+    {
         "id": "E4",
         "name": "interview_E4_deepfm_ple_lite_homo_esmm",
         "config": "configs/experiments/interview_chain/E4_deepfm_ple_lite_homo_esmm.yaml",
@@ -123,14 +130,18 @@ def print_step(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 
-def find_existing_run_dir(exp_name: str, runs_root: Path = Path("runs")) -> Optional[Path]:
+def find_existing_run_dir(
+    exp_name: str,
+    runs_root: Path = Path("runs"),
+    require_metrics: bool = True,
+) -> Optional[Path]:
     """
     查找已存在的 run_dir（用于 --resume）
     
-    策略：
-      - 搜索 runs/{exp_name}_* 目录
-      - 返回最新的（按 mtime 排序）
-      - 确保目录内有 config.yaml 和 metrics.jsonl（完整性校验）
+        策略：
+            - 搜索 runs/{exp_name}_* 目录
+            - 返回最新的（按 mtime 排序）
+            - require_metrics=True 时确保目录内有 config.yaml 和 metrics.jsonl（完整性校验）
     """
     if not runs_root.exists():
         return None
@@ -141,15 +152,19 @@ def find_existing_run_dir(exp_name: str, runs_root: Path = Path("runs")) -> Opti
     for run_dir in candidates:
         if run_dir.is_dir():
             # 完整性校验
-            if (run_dir / "config.yaml").exists() and (run_dir / "metrics.jsonl").exists():
-                return run_dir
+            if require_metrics:
+                if (run_dir / "config.yaml").exists() and (run_dir / "metrics.jsonl").exists():
+                    return run_dir
+            else:
+                if (run_dir / "config.yaml").exists():
+                    return run_dir
     
     return None
 
 
 def parse_run_dir_from_stdout(stdout: str) -> Optional[Path]:
     """
-    从训练 stdout 中解析 run_dir
+    从训练 stdout/stderr 合并输出中解析 run_dir
     
     预期日志格式（来自 trainer.py）：
       - INFO: Trainer initialized. run_dir=runs/exp_name_20260203_123456 ...
@@ -329,9 +344,12 @@ def diagnose_failure(returncode: int, stdout: str, stderr: str, run_dir: Optiona
         if re.search(pattern, combined_output, re.IGNORECASE):
             lines.append(f"  ⚠️  可能原因：{hint}")
     
-    # 打印最后 200 行 stdout（通常包含最关键的错误信息）
+    # 打印最后 200 行 stdout/stderr（通常包含最关键的错误信息）
     lines.append("\n--- 最后 200 行 stdout ---")
     lines.append("\n".join(stdout.splitlines()[-200:]))
+
+    lines.append("\n--- 最后 200 行 stderr ---")
+    lines.append("\n".join(stderr.splitlines()[-200:]))
     
     # 如果 run_dir 存在，打印 train.log 最后 100 行
     if run_dir and run_dir.exists():
@@ -423,7 +441,7 @@ def run_experiment(
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=3600 * 6,  # 6 小时超时（max_train_steps=40000 预计 1-3 小时）
+            timeout=3600 * 12,  # 12 小时超时（max_train_steps=40000 预计 1-3 小时）
         )
         returncode = proc.returncode
         stdout = proc.stdout
@@ -434,7 +452,7 @@ def run_experiment(
             "status": "failed",
             "run_dir": None,
             "metrics": None,
-            "error": "训练超时（6 小时）",
+            "error": "训练超时（12 小时）",
         }
     except Exception as e:
         return {
@@ -450,10 +468,13 @@ def run_experiment(
     print_step(f"训练结束 - {end_time.strftime('%Y-%m-%d %H:%M:%S')} (耗时 {duration:.0f}s)")
     
     # 解析 run_dir
-    run_dir = parse_run_dir_from_stdout(stdout)
+    combined_output = stdout + "\n" + stderr
+    run_dir = parse_run_dir_from_stdout(combined_output)
     if run_dir is None:
-        print_step("⚠️  Warning: 无法从 stdout 解析 run_dir，尝试查找最新目录")
-        run_dir = find_existing_run_dir(exp_name)
+        print_step("⚠️  Warning: 无法从 stdout/stderr 解析 run_dir，尝试查找最新目录")
+        run_dir = find_existing_run_dir(exp_name, require_metrics=True)
+        if run_dir is None:
+            run_dir = find_existing_run_dir(exp_name, require_metrics=False)
     
     # 检查退出码
     if returncode != 0:

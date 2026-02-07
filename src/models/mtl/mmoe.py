@@ -154,7 +154,7 @@ class MMoE(nn.Module):
             [
                 MLP(
                     input_dim=in_dim,
-                    hidden_dims=expert_output_dims[:-1],  # hidden layers (last dim is output)
+                    hidden_dims=expert_output_dims,
                     activation=str(mmoe_cfg.get("activation", "relu")),
                     dropout=float(mmoe_cfg.get("dropout", 0.0)),
                     use_bn=bool(mmoe_cfg.get("use_bn", False)),
@@ -439,6 +439,44 @@ class MMoE(nn.Module):
             gate_reg_loss = gate_reg_loss + self.load_balance_kl_weight * mean_kl
         
         return gate_reg_loss, mean_entropy, mean_kl
+    
+    def get_expert_health_data(self) -> Dict[str, Any]:
+        """
+        获取专家健康诊断所需的模型内部数据。
+        
+        用于 ExpertHealthDiagnostics 收集诊断数据。
+        
+        Returns:
+            Dict containing:
+              - expert_modules: List[(name, module)] 所有专家模块
+              - expert_names: Dict[task -> List[str]] 每任务专家名称
+              - aligners: Dict[task -> module] (MMoE 无 aligner，返回空字典)
+              - hetero_enabled: bool (MMoE 专家同构，返回 False)
+        """
+        from typing import List, Tuple
+        
+        data: Dict[str, Any] = {
+            "hetero_enabled": False,  # MMoE 专家同构
+            "expert_names": {},
+        }
+        
+        # 收集所有专家模块
+        expert_modules: List[Tuple[str, torch.nn.Module]] = []
+        for i, expert in enumerate(self.experts):
+            name = f"expert_{i}"
+            expert_modules.append((name, expert))
+        
+        data["expert_modules"] = expert_modules
+        
+        # 为每个任务构建专家名称列表（MMoE 中所有任务共享同一组专家）
+        expert_names_list = [f"expert_{i}" for i in range(len(self.experts))]
+        for task in self.tasks:
+            data["expert_names"][task] = expert_names_list
+        
+        # MMoE 无 output aligner
+        data["aligners"] = {}
+        
+        return data
 
 
 __all__ = ["MMoE"]

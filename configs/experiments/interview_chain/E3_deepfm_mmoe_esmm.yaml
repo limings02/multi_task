@@ -29,9 +29,9 @@ esmm:
 data:
   metadata_path: "data/processed/metadata.json"
   batch_size: 1024                    # 公共锁定
-  num_workers: 6
-  num_workers_valid: 0
-  prefetch_factor: 2
+  num_workers: 2
+  num_workers_valid: 2
+  prefetch_factor: 1
   pin_memory: true
   persistent_workers: false
   drop_last: false
@@ -83,7 +83,7 @@ model:
     gate_hidden_dims: []              # 简单 gate，无隐藏层
     input: "deep_h"                   # 输入为 DeepFM 的 deep_h
     dropout: 0.0                      # 专家内部无 dropout
-  
+    log_gates: true
   # Head 配置（公共锁定）
   heads:
     default:
@@ -124,7 +124,7 @@ optim:
     target: "both"
     type: "cosine"
     warmup_steps: 5000
-    total_steps: 40000                # 公共锁定：确保所有实验训练步数一致
+    total_steps: 80000                # 公共锁定：确保所有实验训练步数一致
     min_lr_ratio: 0.1
 
 # ============================================================================
@@ -196,3 +196,32 @@ runtime:
     confirm_times: 1
     cooldown_evals: 0
     log_decision: true
+
+  # 专家健康诊断配置
+  expert_health_diag:
+    enabled: true
+    log_interval: 1000
+    log_on_valid: true
+    utilization:
+      enabled: true
+      dead_threshold: 0.01
+      monopoly_threshold: 0.8
+      compute_gini: true
+    output_stats:
+      enabled: true
+      per_expert_stats: true
+      cross_expert_similarity: true
+      similarity_alert_threshold: 0.95
+    gradient:
+      enabled: true
+      per_expert_grad_norm: true
+      vanish_threshold: 1.0e-6
+      explode_threshold: 100.0
+    type_specialization:
+      enabled: true
+      aggregate_by_type: true
+      cross_task_specialization: true
+    aligner:
+      enabled: true
+      log_scale_stats: true
+      log_distribution_change: false

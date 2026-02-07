@@ -34,9 +34,9 @@ esmm:
 data:
   metadata_path: "data/processed/metadata.json"
   batch_size: 1024                    # 公共锁定
-  num_workers: 6
-  num_workers_valid: 0
-  prefetch_factor: 2
+  num_workers: 2
+  num_workers_valid: 2
+  prefetch_factor: 1
   pin_memory: true
   persistent_workers: false
   drop_last: false
@@ -207,7 +207,7 @@ model:
     fusion: "concat"
     adapter_mlp_dims: [128]
     norm: "layernorm"
-  
+  log_gates: true
   # Head 配置（公共锁定）
   heads:
     default:
@@ -248,7 +248,7 @@ optim:
     target: "both"
     type: "cosine"
     warmup_steps: 5000
-    total_steps: 40000                # 公共锁定：确保所有实验训练步数一致
+    total_steps: 80000                # 公共锁定：确保所有实验训练步数一致
     min_lr_ratio: 0.1
 
 # ============================================================================

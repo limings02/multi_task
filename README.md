@@ -168,6 +168,9 @@ train_loader = build_dataloader(
 python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train.yaml
 python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train_ctr.yaml
 python -m src.cli.main train --config configs/experiments/deepfm_sharedbottom_train_cvr.yaml
+
+runtime:
+  resume_path: "runs/your_experiment_dir/ckpt_best.pt"
 ```
 ## Phase 5 Eval (AUC/LogLoss/ECE/Funnel
 - 新增评估模块：src/eval/metrics.py, src/train/infer.py, src/eval/calibration.py, src/eval/funnel.py 

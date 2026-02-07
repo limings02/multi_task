@@ -417,42 +417,52 @@ def compute_type_specialization(
         # 找出共享专家（出现在所有任务中的专家）
         tasks = list(gate_weights_per_task.keys())
         if len(tasks) >= 2:
-            # 简化：只比较前两个任务
-            task1, task2 = tasks[0], tasks[1]
-            names1 = set(expert_names_per_task.get(task1, []))
-            names2 = set(expert_names_per_task.get(task2, []))
+            # 简化：只比较前两个有完整信息的任务
+            task1, task2 = None, None
+            for task in tasks:
+                if task in expert_names_per_task and expert_names_per_task[task]:
+                    if task1 is None:
+                        task1 = task
+                    elif task2 is None:
+                        task2 = task
+                        break
             
-            # 计算 task1 和 task2 的 top1_share
-            def get_top1_share_dict(gate_w, names):
-                gate_w_f32 = gate_w.float()
-                K = gate_w.size(-1)
-                top1_indices = torch.argmax(gate_w_f32, dim=-1)
-                top1_counts = torch.bincount(top1_indices, minlength=K).float()
-                B = float(gate_w.size(0))
-                top1_share = (top1_counts / (B + 1e-8)).cpu().numpy()
-                return {name: float(top1_share[i]) for i, name in enumerate(names)}
-            
-            share1 = get_top1_share_dict(gate_weights_per_task[task1], expert_names_per_task[task1])
-            share2 = get_top1_share_dict(gate_weights_per_task[task2], expert_names_per_task[task2])
-            
-            # 找共享专家（名称包含 SHARE）
-            shared_names = [n for n in names1 if "[SHARE]" in n]
-            
-            specialization_scores = {}
-            for name in shared_names:
-                if name in share1 and name in share2:
-                    # 特化分数 = 两个任务对该专家使用差异的绝对值
-                    spec_score = abs(share1[name] - share2[name])
-                    specialization_scores[name] = {
-                        f"{task1}_share": share1[name],
-                        f"{task2}_share": share2[name],
-                        "specialization_score": spec_score,
-                    }
-            
-            metrics["cross_task_specialization"] = {
-                "tasks_compared": [task1, task2],
-                "shared_expert_scores": specialization_scores,
-            }
+            # 如果找到了两个有效任务，才进行比较
+            if task1 is not None and task2 is not None:
+                names1 = set(expert_names_per_task.get(task1, []))
+                names2 = set(expert_names_per_task.get(task2, []))
+                
+                # 计算 task1 和 task2 的 top1_share
+                def get_top1_share_dict(gate_w, names):
+                    gate_w_f32 = gate_w.float()
+                    K = gate_w.size(-1)
+                    top1_indices = torch.argmax(gate_w_f32, dim=-1)
+                    top1_counts = torch.bincount(top1_indices, minlength=K).float()
+                    B = float(gate_w.size(0))
+                    top1_share = (top1_counts / (B + 1e-8)).cpu().numpy()
+                    return {name: float(top1_share[i]) for i, name in enumerate(names)}
+                
+                share1 = get_top1_share_dict(gate_weights_per_task[task1], expert_names_per_task[task1])
+                share2 = get_top1_share_dict(gate_weights_per_task[task2], expert_names_per_task[task2])
+                
+                # 找共享专家（名称包含 SHARE）
+                shared_names = [n for n in names1 if "[SHARE]" in n]
+                
+                specialization_scores = {}
+                for name in shared_names:
+                    if name in share1 and name in share2:
+                        # 特化分数 = 两个任务对该专家使用差异的绝对值
+                        spec_score = abs(share1[name] - share2[name])
+                        specialization_scores[name] = {
+                            f"{task1}_share": share1[name],
+                            f"{task2}_share": share2[name],
+                            "specialization_score": spec_score,
+                        }
+                
+                metrics["cross_task_specialization"] = {
+                    "tasks_compared": [task1, task2],
+                    "shared_expert_scores": specialization_scores,
+                }
     
     return metrics
 
