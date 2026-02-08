@@ -162,7 +162,6 @@ def run_eval(
     ctr_logit_list = [] if use_ctr else None
     cvr_logit_list = [] if use_cvr else None
     ctcvr_logit_list = [] if use_cvr and use_esmm else None
-    p_cvr_logit_list = [] if use_cvr and use_esmm else None
     ctr_wide_logit_list = [] if use_ctr else None
     ctr_parts_list = [] if use_ctr else None
     logit_parts_decomposable = None
@@ -206,24 +205,18 @@ def run_eval(
                 if cvr_logit.dim() > 1:
                     cvr_logit = cvr_logit.view(-1)
                 if use_esmm:
-                    ctcvr_logit = cvr_logit
-                    cvr_logit_list.append(ctcvr_logit.cpu().numpy())
+                    cvr_logit_list.append(cvr_logit.cpu().numpy())
                     if ctcvr_logit_list is not None:
+                        ctr_logit_for_joint = outputs["ctr"]
+                        if ctr_logit_for_joint.dim() > 1:
+                            ctr_logit_for_joint = ctr_logit_for_joint.view(-1)
+                        p_ctcvr = sigmoid(ctr_logit_for_joint) * sigmoid(cvr_logit)
+                        p_ctcvr = torch.clamp(p_ctcvr, min=esmm_eps, max=1.0 - esmm_eps)
+                        ctcvr_logit = torch.log(p_ctcvr / (1.0 - p_ctcvr))
                         ctcvr_logit_list.append(ctcvr_logit.cpu().numpy())
                     if y_ctcvr_list is not None and "y_ctcvr" in labels_dev:
                         y_ctcvr_list.append(labels_dev["y_ctcvr"].cpu().numpy())
 
-                    # Derived post-click CVR prob/logit
-                    ctr_logit_for_ratio = outputs["ctr"]
-                    if ctr_logit_for_ratio.dim() > 1:
-                        ctr_logit_for_ratio = ctr_logit_for_ratio.view(-1)
-                    p_ctr = sigmoid(ctr_logit_for_ratio)
-                    p_ctcvr = sigmoid(ctcvr_logit)
-                    p_cvr = p_ctcvr / (p_ctr + esmm_eps)
-                    p_cvr = torch.clamp(p_cvr, max=1.0)
-                    p_cvr_logit = torch.log(p_cvr / torch.clamp(1.0 - p_cvr, min=esmm_eps))
-                    if p_cvr_logit_list is not None:
-                        p_cvr_logit_list.append(p_cvr_logit.cpu().numpy())
                     y_cvr_list.append(labels_dev["y_cvr"].cpu().numpy())
                     # click mask equivalent: clicked rows (y_ctr==1)
                     click_mask_list.append(labels_dev["y_ctr"].cpu().numpy())
@@ -241,7 +234,6 @@ def run_eval(
     ctr_logit_raw = np.concatenate(ctr_logit_list) if use_ctr and ctr_logit_list else np.array([])
     cvr_logit = np.concatenate(cvr_logit_list) if use_cvr and cvr_logit_list else np.array([])
     ctcvr_logit = np.concatenate(ctcvr_logit_list) if ctcvr_logit_list else None
-    p_cvr_logit = np.concatenate(p_cvr_logit_list) if p_cvr_logit_list else None
     ctr_wide_logit_raw = np.concatenate(ctr_wide_logit_list) if ctr_wide_logit_list else np.array([])
 
     # Apply logit correction to CTR predictions (negative sampling affects CTR label distribution)
@@ -254,9 +246,13 @@ def run_eval(
     if use_cvr:
         if use_esmm:
             cvr_metrics_masked = compute_binary_metrics(
-                y_cvr, p_cvr_logit if p_cvr_logit is not None else np.array([]), mask=(y_ctr > 0.5)
+                y_cvr, cvr_logit, mask=(y_ctr > 0.5)
             )
-            ctcvr_metrics = compute_binary_metrics(y_ctcvr, cvr_logit) if (y_ctcvr is not None) else empty_metrics
+            ctcvr_metrics = (
+                compute_binary_metrics(y_ctcvr, ctcvr_logit)
+                if (y_ctcvr is not None and ctcvr_logit is not None)
+                else empty_metrics
+            )
         else:
             cvr_metrics_masked = compute_binary_metrics(y_cvr, cvr_logit, mask=click_mask > 0.5)
             ctcvr_metrics = empty_metrics
@@ -269,9 +265,7 @@ def run_eval(
     ece_ctr = compute_ece_from_logits(y_ctr, ctr_logit) if use_ctr else {"ece": None, "bins": []}
     if use_cvr:
         if use_esmm:
-            ece_cvr_masked = compute_ece_from_logits(
-                y_cvr, p_cvr_logit if p_cvr_logit is not None else np.array([]), mask=(y_ctr > 0.5)
-            )
+            ece_cvr_masked = compute_ece_from_logits(y_cvr, cvr_logit, mask=(y_ctr > 0.5))
         else:
             ece_cvr_masked = compute_ece_from_logits(y_cvr, cvr_logit, mask=click_mask > 0.5)
     else:
@@ -279,10 +273,7 @@ def run_eval(
 
     pred_ctr_prob = sigmoid(torch.from_numpy(ctr_logit)).numpy() if use_ctr and ctr_logit.size > 0 else np.array([])
     if use_cvr and cvr_logit.size > 0:
-        if use_esmm:
-            pred_cvr_prob = sigmoid(torch.from_numpy(cvr_logit)).numpy() / (pred_ctr_prob + esmm_eps)
-        else:
-            pred_cvr_prob = sigmoid(torch.from_numpy(cvr_logit)).numpy()
+        pred_cvr_prob = sigmoid(torch.from_numpy(cvr_logit)).numpy()
     else:
         pred_cvr_prob = np.array([])
     funnel_stats = None

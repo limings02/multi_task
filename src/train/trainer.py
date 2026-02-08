@@ -86,8 +86,15 @@ class Trainer:
         self.metrics_meta = {**tags, "config_path": str(self.config_path) if self.config_path else None}
         self.metrics_meta["mode"] = "esmm" if self.use_esmm else "non-esmm"
         exp_name = cfg.get("experiment", {}).get("name", "exp")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = Path("runs") / f"{exp_name}_{ts}"
+        resume_path = cfg.get("runtime", {}).get("resume_path")
+        if resume_path:
+            # Resume: reuse the run directory of the checkpoint for appending logs
+            self.run_dir = Path(resume_path).resolve().parent
+        else:
+            # Fresh training: create new run directory with timestamp
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.run_dir = Path("runs") / f"{exp_name}_{ts}"
+        
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
         # Save config snapshot
@@ -460,6 +467,8 @@ class Trainer:
             # Resolve gradient diagnostics parameters
             grad_diag_every = runtime.get("grad_diag_every")  # None means use log_every
             grad_diag_min_tasks = int(runtime.get("grad_diag_min_tasks", 2))
+            grad_samples_target = int(runtime.get("grad_samples_target", 1000))
+            conflict_ema_alpha = float(runtime.get("conflict_ema_alpha", 0.1))
 
             train_metrics = train_one_epoch(
                 self.model,
@@ -487,6 +496,8 @@ class Trainer:
                 lr_scheduler_bundle=self.lr_scheduler_bundle,
                 cfg=self.cfg,
                 expert_health_diag=self.expert_health_diag,
+                grad_samples_target=grad_samples_target,
+                conflict_ema_alpha=conflict_ema_alpha,
             )
             self.global_step += train_metrics.get("steps", 0)
             train_record = {"epoch": epoch, "split": "train", **train_metrics}

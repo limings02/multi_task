@@ -10,6 +10,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch import amp as torch_amp
 from src.eval.metrics import compute_binary_metrics
 from src.train.grad_diag import GradientDiagnostics
+from src.train.grad_conflict_sampler import GradConflictSampler
 from src.utils.health_metrics import (
     compute_label_counts,
     compute_logit_stats,
@@ -170,6 +171,8 @@ def train_one_epoch(
     lr_scheduler_bundle: Optional["LRSchedulerBundle"] = None,
     cfg: Optional[Dict[str, Any]] = None,
     expert_health_diag: Optional[Any] = None,  # ExpertHealthDiagnostics
+    grad_samples_target: int = 1000,
+    conflict_ema_alpha: float = 0.1,
 ) -> Dict[str, float]:
     """
     Train for one epoch and emit aggregated metrics plus optional gradient diagnostics.
@@ -200,36 +203,29 @@ def train_one_epoch(
     esmm_metric_count = 0
     cvr_aux_count = 0
 
-    # Gradient diagnostics accumulators (new dynamic approach)
-    grad_norm_ctr_vals: List[float] = []
-    grad_norm_cvr_vals: List[float] = []
-    grad_norm_ctcvr_vals: List[float] = []  # For ESMM mode
-    grad_norm_ratio_vals: List[float] = []
-    grad_cos_dense_vals: List[float] = []
-    grad_cos_sparse_vals: List[float] = []
-    grad_cos_all_vals: List[float] = []
-    conflict_hits = 0
-    conflict_hits_dense = 0  # 新增：独立统计 dense 冲突
-    conflict_hits_sparse = 0  # 新增：独立统计 sparse 冲突
-    grad_samples = 0
-    shared_dense_count_last = 0
-    shared_sparse_count_last = 0
-
-    # Initialize gradient diagnostics object (new dynamic approach)
+    # ============================================================
+    # Gradient conflict sampler (replaces old inline accumulators)
+    # Computes sample_interval from expected epoch steps to reach target.
+    # ============================================================
     grad_diag: Optional[GradientDiagnostics] = None
+    grad_sampler: Optional[GradConflictSampler] = None
     if grad_diag_enabled:
         grad_diag = GradientDiagnostics(
-            model, 
+            model,
             min_tasks=grad_diag_min_tasks,
             cache_refresh="epoch",
         )
         grad_diag.set_epoch(epoch)
-    
-    # Effective gradient diagnosis frequency
-    diag_every = grad_diag_every if grad_diag_every is not None else log_every
-
-    # Legacy: keep shared_params for backward compat logging, but don't use for actual diag
-    shared_params: List[Tuple[str, torch.nn.Parameter]] = _select_shared_params(model) if grad_diag_enabled else []
+        grad_sampler = GradConflictSampler(
+            grad_samples_target=grad_samples_target,
+            conflict_ema_alpha=conflict_ema_alpha,
+        )
+        # Estimate expected steps for this epoch
+        if max_steps is not None:
+            expected_steps = min(len(loader), max_steps - global_step)
+        else:
+            expected_steps = len(loader)
+        grad_sampler.init_epoch(max(1, expected_steps))
     ctr_raw_count = cvr_raw_count = 0
 
     # ============================================================
@@ -274,11 +270,13 @@ def train_one_epoch(
         t_data_end = time.time()
         data_load_time += t_data_end - t_batch_start
         
-        if max_steps is not None and current_global_step >= max_steps:
-            break
-
         # Update global_step in loss_fn for aux_focal warmup control
         current_global_step = global_step + step
+        
+        # Check if we've reached max_train_steps (for early stopping or resume)
+        if max_steps is not None and current_global_step >= max_steps:
+            break
+        
         if hasattr(loss_fn, "global_step"):
             loss_fn.global_step = current_global_step
 
@@ -566,48 +564,41 @@ def train_one_epoch(
         t_batch_start = time.time()
 
         # ============================================================
-        # New Dynamic Gradient Diagnostics (supports dense + sparse)
-        # current_global_step 来自 line 245: global_step + step
+        # Gradient Conflict Sampling (auto-interval to reach target)
+        # current_global_step 来自 global_step + step
         # ============================================================
         should_sample_grad = (
             grad_diag_enabled
             and grad_diag is not None
+            and grad_sampler is not None
             and has_ctr
             and has_cvr
-            and (current_global_step % diag_every == 0)
+            and grad_sampler.should_sample(step)
         )
         if should_sample_grad:
-            _diag_logger.debug(
-                "grad_diag: Starting diagnostics at global_step=%d (diag_every=%d)",
-                current_global_step, diag_every
-            )
             try:
                 # Zero gradients before diagnostics
                 optimizer_bundle.zero_grad(set_to_none=True)
-                
+
                 # Keep diagnostics in full precision
                 with torch_amp.autocast(enabled=False, device_type=amp_device_type):
                     diag_outputs = model(features_dev)
-                    
+
                     # Build per-task losses for gradient computation
                     # CTR loss: full batch
                     loss_ctr_diag = F.binary_cross_entropy_with_logits(
                         diag_outputs["ctr"].float(), labels["y_ctr"].float(), reduction="mean"
                     )
-                    
+
                     # For ESMM: use CTCVR loss; for non-ESMM: use masked CVR loss
                     if use_esmm:
-                        # Standard ESMM: compute CTCVR loss
                         log_p_ctr = F.logsigmoid(diag_outputs["ctr"].float())
                         log_p_cvr = F.logsigmoid(diag_outputs["cvr"].float())
                         log_p_ctcvr = log_p_ctr + log_p_cvr
-                        # Simple BCE approximation for gradient analysis
                         y_ctcvr = labels["y_ctcvr"].float()
                         loss_ctcvr_diag = -(y_ctcvr * log_p_ctcvr + (1 - y_ctcvr) * torch.log1p(-torch.exp(log_p_ctcvr).clamp(max=1-1e-7))).mean()
-                        
                         losses_by_task = {"ctr": loss_ctr_diag, "ctcvr": loss_ctcvr_diag}
                     else:
-                        # Non-ESMM: masked CVR loss
                         mask = labels["click_mask"].float()
                         mask_sum = mask.sum()
                         if mask_sum > 0:
@@ -617,71 +608,26 @@ def train_one_epoch(
                             loss_cvr_diag = (loss_vec * mask).sum() / (mask_sum + EPS)
                         else:
                             loss_cvr_diag = torch.tensor(0.0, device=device, requires_grad=True)
-                        
                         losses_by_task = {"ctr": loss_ctr_diag, "cvr": loss_cvr_diag}
-                
-                # Compute gradient metrics using new dynamic approach
+
+                # Compute gradient metrics
                 diag_metrics = grad_diag.compute_metrics(losses_by_task)
-                
-                # Extract and accumulate metrics
-                shared_dense_count_last = diag_metrics.get("shared_dense_count", 0)
-                shared_sparse_count_last = diag_metrics.get("shared_sparse_count", 0)
-                
-                # Norms
-                if use_esmm:
-                    norm_ctr = diag_metrics.get("grad_norm_shared_ctr")
-                    norm_ctcvr = diag_metrics.get("grad_norm_shared_ctcvr")
-                    if norm_ctr is not None:
-                        grad_norm_ctr_vals.append(norm_ctr)
-                    if norm_ctcvr is not None:
-                        grad_norm_ctcvr_vals.append(norm_ctcvr)
-                    if norm_ctr is not None and norm_ctcvr is not None and norm_ctr > 0:
-                        grad_norm_ratio_vals.append(norm_ctcvr / norm_ctr)
-                else:
-                    norm_ctr = diag_metrics.get("grad_norm_shared_ctr")
-                    norm_cvr = diag_metrics.get("grad_norm_shared_cvr")
-                    if norm_ctr is not None:
-                        grad_norm_ctr_vals.append(norm_ctr)
-                    if norm_cvr is not None:
-                        grad_norm_cvr_vals.append(norm_cvr)
-                    if norm_ctr is not None and norm_cvr is not None and norm_ctr > 0:
-                        grad_norm_ratio_vals.append(norm_cvr / norm_ctr)
-                
-                # Cosine similarities (dense, sparse, all)
-                cos_dense = diag_metrics.get("grad_cosine_shared_dense")
-                cos_sparse = diag_metrics.get("grad_cosine_shared_sparse")
-                cos_all = diag_metrics.get("grad_cosine_shared_all")
-                
-                # 修复 conflict_rate 统计：分别统计 dense/sparse/all 的冲突
-                if cos_dense is not None:
-                    grad_cos_dense_vals.append(cos_dense)
-                    if cos_dense < 0:
-                        conflict_hits_dense += 1
-                if cos_sparse is not None:
-                    grad_cos_sparse_vals.append(cos_sparse)
-                    if cos_sparse < 0:
-                        conflict_hits_sparse += 1
-                if cos_all is not None:
-                    grad_cos_all_vals.append(cos_all)
-                    if cos_all < 0:
-                        conflict_hits += 1
-                
-                grad_samples += 1
-                _diag_logger.debug(
-                    "grad_diag: Sample %d completed. dense_count=%d, sparse_count=%d, "
-                    "cos_dense=%s, cos_sparse=%s, cos_all=%s",
-                    grad_samples, shared_dense_count_last, shared_sparse_count_last,
-                    cos_dense, cos_sparse, cos_all
+
+                # Record sample in sampler (handles dense/sparse/conflict tracking)
+                grad_sampler.record_sample(
+                    diag_metrics, global_step=current_global_step, use_esmm=use_esmm
                 )
-                
+
                 # Zero gradients after diagnostics
                 optimizer_bundle.zero_grad(set_to_none=True)
-                
+
             except Exception as e:
                 _diag_logger.warning(
                     "grad_diag: error during computation at global_step=%d: %s",
                     current_global_step, e, exc_info=True
                 )
+                if grad_sampler is not None:
+                    grad_sampler.record_error(current_global_step)
                 optimizer_bundle.zero_grad(set_to_none=True)
 
         if (step + 1) % log_every == 0:
@@ -819,60 +765,48 @@ def train_one_epoch(
     if mean_ctr_scaled is not None and mean_cvr_scaled is not None:
         loss_ratio_scaled = float(mean_cvr_scaled / (mean_ctr_scaled + EPS))
 
-    # Compute gradient diagnostic percentiles
-    grad_cos_dense_p10, grad_cos_dense_p50, grad_cos_dense_p90 = _compute_grad_percentiles(grad_cos_dense_vals)
-    grad_cos_sparse_p10, grad_cos_sparse_p50, grad_cos_sparse_p90 = _compute_grad_percentiles(grad_cos_sparse_vals)
-    grad_cos_all_p10, grad_cos_all_p50, grad_cos_all_p90 = _compute_grad_percentiles(grad_cos_all_vals)
-    
-    grad_metrics = {
-        # Norms
-        "grad_norm_shared_ctr_mean": (sum(grad_norm_ctr_vals) / len(grad_norm_ctr_vals)) if grad_norm_ctr_vals else None,
-        "grad_norm_shared_cvr_mean": (sum(grad_norm_cvr_vals) / len(grad_norm_cvr_vals)) if grad_norm_cvr_vals else None,
-        "grad_norm_shared_ctcvr_mean": (sum(grad_norm_ctcvr_vals) / len(grad_norm_ctcvr_vals)) if grad_norm_ctcvr_vals else None,
-        "grad_norm_ratio_mean": (sum(grad_norm_ratio_vals) / len(grad_norm_ratio_vals)) if grad_norm_ratio_vals else None,
-        
-        # Cosine similarities - dense
-        "grad_cosine_shared_dense_mean": (sum(grad_cos_dense_vals) / len(grad_cos_dense_vals)) if grad_cos_dense_vals else None,
-        "grad_cosine_dense_p10": grad_cos_dense_p10,
-        "grad_cosine_dense_p50": grad_cos_dense_p50,
-        "grad_cosine_dense_p90": grad_cos_dense_p90,
-        
-        # Cosine similarities - sparse
-        "grad_cosine_shared_sparse_mean": (sum(grad_cos_sparse_vals) / len(grad_cos_sparse_vals)) if grad_cos_sparse_vals else None,
-        "grad_cosine_sparse_p10": grad_cos_sparse_p10,
-        "grad_cosine_sparse_p50": grad_cos_sparse_p50,
-        "grad_cosine_sparse_p90": grad_cos_sparse_p90,
-        
-        # Cosine similarities - combined
-        "grad_cosine_shared_mean": (sum(grad_cos_all_vals) / len(grad_cos_all_vals)) if grad_cos_all_vals else None,
-        "grad_cosine_p10": grad_cos_all_p10,
-        "grad_cosine_p50": grad_cos_all_p50,
-        "grad_cosine_p90": grad_cos_all_p90,
-        
-        # Conflict detection (只保留 all 的冲突率字段，避免破坏 schema)
-        "conflict_rate": (conflict_hits / grad_samples) if grad_samples else None,
-        "grad_samples": grad_samples,
-        
-        # Shared param counts (from last sample)
-        "shared_dense_count": shared_dense_count_last if grad_samples > 0 else None,
-        "shared_sparse_count": shared_sparse_count_last if grad_samples > 0 else None,
-    }
-    
-    # 打印详细的冲突率诊断信息（不新增 metrics 字段）
-    if grad_samples > 0:
-        conflict_rate_dense = (conflict_hits_dense / len(grad_cos_dense_vals)) if grad_cos_dense_vals else None
-        conflict_rate_sparse = (conflict_hits_sparse / len(grad_cos_sparse_vals)) if grad_cos_sparse_vals else None
-        conflict_rate_all = (conflict_hits / grad_samples) if grad_samples else None
-        _diag_logger.info(
-            "[grad_conflict_diagnosis] epoch=%d samples=%d | "
-            "conflict_rate: dense=%.3f (%d/%d), sparse=%.3f (%d/%d), all=%.3f (%d/%d) | "
-            "cosine_p10: dense=%.3f, sparse=%.3f, all=%.3f",
-            epoch, grad_samples,
-            conflict_rate_dense or 0.0, conflict_hits_dense, len(grad_cos_dense_vals) if grad_cos_dense_vals else 0,
-            conflict_rate_sparse or 0.0, conflict_hits_sparse, len(grad_cos_sparse_vals) if grad_cos_sparse_vals else 0,
-            conflict_rate_all or 0.0, conflict_hits, grad_samples,
-            grad_cos_dense_p10 or 0.0, grad_cos_sparse_p10 or 0.0, grad_cos_all_p10 or 0.0,
-        )
+    # ============================================================
+    # Aggregate gradient conflict metrics from sampler
+    # ============================================================
+    final_global_step = global_step + steps
+    if grad_sampler is not None and grad_diag_enabled:
+        grad_metrics = grad_sampler.aggregate(epoch=epoch, global_step=final_global_step)
+    else:
+        # No gradient diagnostics — fill with None for schema consistency
+        grad_metrics = {
+            "global_step": final_global_step,
+            "grad_samples_target": None,
+            "grad_samples_collected": None,
+            "grad_samples_skipped_no_cvr_grad": None,
+            "grad_sample_interval_steps": None,
+            "grad_conflict_error_count": None,
+            "grad_samples": None,
+            "grad_norm_shared_ctr_mean": None,
+            "grad_norm_shared_cvr_mean": None,
+            "grad_norm_shared_ctcvr_mean": None,
+            "grad_norm_ratio_mean": None,
+            "grad_norm_ratio_p50": None,
+            "grad_norm_ratio_p90": None,
+            "grad_cosine_shared_dense_mean": None,
+            "grad_cosine_dense_p10": None,
+            "grad_cosine_dense_p50": None,
+            "grad_cosine_dense_p90": None,
+            "grad_cosine_shared_sparse_mean": None,
+            "grad_cosine_sparse_p10": None,
+            "grad_cosine_sparse_p50": None,
+            "grad_cosine_sparse_p90": None,
+            "grad_cosine_shared_mean": None,
+            "grad_cosine_p10": None,
+            "grad_cosine_p50": None,
+            "grad_cosine_p90": None,
+            "conflict_rate": None,
+            "conflict_rate_ema": None,
+            "neg_conflict_strength_mean": None,
+            "shared_dense_count": None,
+            "shared_sparse_count": None,
+            "cvr_has_grad": None,
+            "cvr_valid_count": None,
+        }
 
     # ESMM-specific metrics
     esmm_metrics = {}
@@ -978,7 +912,6 @@ def validate(
     ctr_logit_list: List[torch.Tensor] = []
     cvr_logit_list: List[torch.Tensor] = []
     ctcvr_logit_list: List[torch.Tensor] = []
-    p_cvr_logit_list: List[torch.Tensor] = []
 
     # Health metrics collection (only when log_health_metrics=True)
     gate_ctr_list: List[torch.Tensor] = []
@@ -1014,27 +947,25 @@ def validate(
                     y_ctr_list.append(labels["y_ctr"].detach().cpu())
                 if has_cvr:
                     if use_esmm:
-                        ctcvr_logit = outputs.get("ctcvr", outputs.get("cvr"))
-                        if ctcvr_logit is None:
-                            raise KeyError("ctcvr/cvr logit missing in outputs during validation")
-                        if ctcvr_logit.dim() > 1:
-                            ctcvr_logit = ctcvr_logit.view(-1)
-                        ctcvr_logit_list.append(ctcvr_logit.detach().cpu())
-                        y_ctcvr_list.append(labels["y_ctcvr"].detach().cpu())
+                        cvr_logit = outputs.get("cvr")
+                        if cvr_logit is None:
+                            raise KeyError("cvr logit missing in outputs during validation")
+                        if cvr_logit.dim() > 1:
+                            cvr_logit = cvr_logit.view(-1)
+                        cvr_logit_list.append(cvr_logit.detach().cpu())
+                        y_cvr_list.append(labels["y_cvr"].detach().cpu())
+                        click_mask_list.append(labels["y_ctr"].detach().cpu())  # click subset mask
 
-                        # Derived CVR (post-click) probability for optional monitoring
+                        # Derived CTCVR for ESMM from p_ctr * p_cvr
                         ctr_logit = outputs["ctr"]
                         if ctr_logit.dim() > 1:
                             ctr_logit = ctr_logit.view(-1)
                         p_ctr = torch.sigmoid(ctr_logit)
-                        p_ctcvr = torch.sigmoid(ctcvr_logit)
-                        p_cvr = p_ctcvr / (p_ctr + esmm_eps)
-                        p_cvr = torch.clamp(p_cvr, max=1.0)
-                        p_cvr_logit = torch.log(p_cvr / torch.clamp(1.0 - p_cvr, min=esmm_eps))
-                        p_cvr_logit_list.append(p_cvr_logit.detach().cpu())
-                        y_cvr_list.append(labels["y_cvr"].detach().cpu())
-                        click_mask_list.append(labels["y_ctr"].detach().cpu())  # click subset mask
-                        cvr_logit_list.append(ctcvr_logit.detach().cpu())  # keep for logging symmetry
+                        p_cvr = torch.sigmoid(cvr_logit)
+                        p_ctcvr = torch.clamp(p_ctr * p_cvr, min=esmm_eps, max=1.0 - esmm_eps)
+                        ctcvr_logit = torch.log(p_ctcvr / (1.0 - p_ctcvr))
+                        ctcvr_logit_list.append(ctcvr_logit.detach().cpu())
+                        y_ctcvr_list.append(labels["y_ctcvr"].detach().cpu())
 
                         # Collect p_ctcvr for health metrics
                         if log_health_metrics:
@@ -1138,16 +1069,7 @@ def validate(
             if auc_ctr is not None:
                 auc_vals.append(auc_ctr)
         if has_cvr and y_cvr_list:
-            if use_esmm and p_cvr_logit_list:
-                # CVR evaluated on clicked subset via derived p_cvr
-                mask_arr = torch.cat(click_mask_list).numpy()  # y_ctr used as mask
-                cvr_metrics = compute_binary_metrics(
-                    torch.cat(y_cvr_list).numpy(),
-                    torch.cat(p_cvr_logit_list).numpy(),
-                    mask=mask_arr > 0.5,
-                )
-                auc_cvr = cvr_metrics.get("auc")
-            else:
+            if click_mask_list and cvr_logit_list:
                 mask_arr = torch.cat(click_mask_list).numpy()
                 cvr_metrics = compute_binary_metrics(
                     torch.cat(y_cvr_list).numpy(),
@@ -1234,12 +1156,35 @@ def validate(
         "steps_per_sec": steps / dur if dur > 0 else 0.0,
         "grad_norm_shared_ctr_mean": None,
         "grad_norm_shared_cvr_mean": None,
+        "grad_norm_shared_ctcvr_mean": None,
         "grad_norm_ratio_mean": None,
+        "grad_norm_ratio_p50": None,
+        "grad_norm_ratio_p90": None,
+        "grad_cosine_shared_dense_mean": None,
+        "grad_cosine_dense_p10": None,
+        "grad_cosine_dense_p50": None,
+        "grad_cosine_dense_p90": None,
+        "grad_cosine_shared_sparse_mean": None,
+        "grad_cosine_sparse_p10": None,
+        "grad_cosine_sparse_p50": None,
+        "grad_cosine_sparse_p90": None,
         "grad_cosine_shared_mean": None,
-        "conflict_rate": None,
         "grad_cosine_p10": None,
         "grad_cosine_p50": None,
         "grad_cosine_p90": None,
+        "conflict_rate": None,
+        "conflict_rate_ema": None,
+        "neg_conflict_strength_mean": None,
+        "grad_samples": None,
+        "grad_samples_target": None,
+        "grad_samples_collected": None,
+        "grad_samples_skipped_no_cvr_grad": None,
+        "grad_sample_interval_steps": None,
+        "grad_conflict_error_count": None,
+        "shared_dense_count": None,
+        "shared_sparse_count": None,
+        "cvr_has_grad": None,
+        "cvr_valid_count": None,
         "auc_ctr": auc_ctr,
         "auc_cvr": auc_cvr,
         "auc_ctcvr": auc_ctcvr,

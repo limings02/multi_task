@@ -98,6 +98,13 @@ EXPERIMENT_MANIFEST = [
         "key_vars": ["mtl=mmoe", "gate_stabilize=enabled", "num_experts=4"],
     },
     {
+        "id": "E3.2",
+        "name": "interview_E3_2_deeepfm_mmoe_light_gatestabilize",
+        "config": "configs/experiments/interview_chain/E3_2_deeepfm_mmoe_light_gatestabilize.yaml",
+        "description": "MMoE + Gate Stabilize（轻量）+ ESMM v2（E3 消融：弱正则/弱退火）",
+        "key_vars": ["mtl=mmoe", "gate_stabilize=light", "num_experts=4"],
+    },
+    {
         "id": "E4",
         "name": "interview_E4_deepfm_ple_lite_homo_esmm",
         "config": "configs/experiments/interview_chain/E4_deepfm_ple_lite_homo_esmm.yaml",
@@ -105,11 +112,25 @@ EXPERIMENT_MANIFEST = [
         "key_vars": ["mtl=ple", "hetero_enabled=false"],
     },
     {
+        "id": "E4.1",
+        "name": "interview_E4_1_deepfm_ple_lite_homo_floor",
+        "config": "configs/experiments/interview_chain/E4_1_deepfm_ple_lite_homo_floor.yaml",
+        "description": "PLE-Lite（同构专家）+ Shared Mass Floor + ESMM v2（E4 消融）",
+        "key_vars": ["mtl=ple", "shared_mass_floor=enabled", "hetero_enabled=false"],
+    },
+    {
         "id": "E5",
         "name": "interview_E5_deepfm_ple_lite_hetero_esmm",
         "config": "configs/experiments/interview_chain/E5_deepfm_ple_lite_hetero_esmm.yaml",
         "description": "PLE-Lite（异构专家）+ ESMM v2（终态）",
         "key_vars": ["mtl=ple", "hetero_enabled=true", "experts=[mlp+crossnet]"],
+    },
+    {
+        "id": "E5.1",
+        "name": "interview_E5_1_deepfm_ple_lite_hetero_floor",
+        "config": "configs/experiments/interview_chain/E5_1_deepfm_ple_lite_hetero_floor.yaml",
+        "description": "PLE-Lite（异构专家）+ Shared Mass Floor + ESMM v2（E5 消融）",
+        "key_vars": ["mtl=ple", "shared_mass_floor=enabled", "hetero_enabled=true"],
     },
 ]
 

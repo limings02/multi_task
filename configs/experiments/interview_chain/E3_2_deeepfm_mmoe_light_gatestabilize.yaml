@@ -19,7 +19,7 @@
 # ============================================================================
 
 experiment:
-  name: "interview_E3_1_deepfm_mmoe_gate_stabilize_esmm"
+  name: "interview_E3_2_deepfm_mmoe_gate_stabilize_esmm"
 
 # ESMM toggle（继承 E3）
 use_esmm: true
